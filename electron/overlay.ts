@@ -391,7 +391,7 @@ export class OverlayManager {
         preload: this.preloadPath,
         nodeIntegration: false,
         contextIsolation: true,
-        sandbox: false,
+        sandbox: true,
         devTools: true,
         backgroundThrottling: false,
       },

@@ -112,7 +112,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       devTools: true,
       backgroundThrottling: false, // keeps audio timer and playback ticks running when app is in background or another workspace
       webSecurity: false,

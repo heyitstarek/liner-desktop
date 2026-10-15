@@ -17,6 +17,7 @@
     "signer:build": "node ../signer/scripts/build-wasm.mjs",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:electron-sandbox": "pnpm run build && electron scripts/electron-sandbox-smoke.cjs",
     "test:watch": "vitest",
     "electron:build": "tsc -b && vite build && electron-builder",
     "electron:build:linux": "tsc -b && vite build && electron-builder --linux",
