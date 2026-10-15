@@ -101,6 +101,18 @@ describe("lyricsCache advanced caching logic", () => {
     });
   });
 
+  describe("candidate ranking comparator", () => {
+    it("treats favored providers equally and antisymmetrically in either order", () => {
+      const polaris = makeCandidate("Polaris Mono", "word_level");
+      const binimum = makeCandidate("Binimum", "word_level");
+
+      expect(compareLyricsCandidates(polaris, binimum)).toBe(0);
+      expect(compareLyricsCandidates(binimum, polaris)).toBe(0);
+      expect(compareLyricsCandidates(polaris, polaris)).toBe(0);
+      expect(compareLyricsCandidates(binimum, binimum)).toBe(0);
+    });
+  });
+
   describe("per-provider caching", () => {
     it("caches multiple providers individually for the same track", () => {
       const lrclibCandidate = makeCandidate("lrclib", "line_level", 70, "[00:01.00] lrclib line");

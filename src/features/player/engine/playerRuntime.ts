@@ -458,6 +458,7 @@ export class PlayerRuntime {
   private pendingStartPositionMs = 0;
 
   public setPendingSeek(positionMs: number): void {
+    const epoch = this.loadEpoch;
     this.pendingStartPositionMs = positionMs;
     usePlayerStore.getState().setPosition(positionMs);
     if (this.audio.src && this.audio.src !== window.location.href) {
@@ -468,6 +469,7 @@ export class PlayerRuntime {
           this.audio.addEventListener(
             "loadedmetadata",
             () => {
+              if (epoch !== this.loadEpoch) return;
               try {
                 this.audio.currentTime = positionMs / 1000;
               } catch {}

@@ -64,8 +64,9 @@ export function compareLyricsCandidates(
   if (isWordA && isWordB) {
     const provA = (a.provider || "").toLowerCase().trim().replace(/[-_]/g, " ");
     const provB = (b.provider || "").toLowerCase().trim().replace(/[-_]/g, " ");
-    if (provA === "polaris mono" || provA === "binimum") return -1;
-    if (provB === "polaris mono" || provB === "binimum") return 1;
+    const favoredA = provA === "polaris mono" || provA === "binimum";
+    const favoredB = provB === "polaris mono" || provB === "binimum";
+    if (favoredA !== favoredB) return favoredA ? -1 : 1;
   }
   return 0;
 }
@@ -83,6 +84,7 @@ function normalizeProviderKey(provider: string): string {
 
 class LyricsCache {
   private memCache = new Map<string, CachedLyricsItem>();
+  private generation = 0;
 
   constructor() {
     this.hydrateIndex();
@@ -359,6 +361,7 @@ class LyricsCache {
   }
 
   clear() {
+    this.generation += 1;
     const index = this.getIndex();
     for (const id of index) {
       try {
@@ -367,6 +370,10 @@ class LyricsCache {
     }
     this.saveIndex([]);
     this.memCache.clear();
+  }
+
+  getGeneration(): number {
+    return this.generation;
   }
 
   getStats(): { count: number; bytes: number } {

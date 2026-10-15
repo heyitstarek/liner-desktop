@@ -528,6 +528,7 @@ class PlayerEngine {
       if (additions.length > 0) {
         const latestStore = usePlayerStore.getState();
         const updatedQueue = [track, ...additions];
+        this.masterPlaylist = updatedQueue;
         latestStore.setQueue(updatedQueue);
         if (latestStore.shuffle) {
           const upcoming = additions;
@@ -842,6 +843,11 @@ class PlayerEngine {
   }
 
   public clearQueue(): void {
+    this.sessionId += 1;
+    if (this.radioAppendTimeout) {
+      clearTimeout(this.radioAppendTimeout);
+      this.radioAppendTimeout = null;
+    }
     usePlayerStore.getState().clearQueue();
     this.masterPlaylist = [];
     this.originalUpcomingQueue = [];
@@ -1054,10 +1060,12 @@ class PlayerEngine {
     if (this.inFlightLyricsPrefetches.has(trackId)) {
       return this.inFlightLyricsPrefetches.get(trackId);
     }
+    const cacheGeneration = lyricsCache.getGeneration();
 
     const prefetchPromise = (async () => {
       try {
         const existing = await linerDb.getLyrics(trackId);
+        if (cacheGeneration !== lyricsCache.getGeneration()) return;
         if (existing) {
           const lastChecked = existing.lastCheckedAt || 0;
           if (Date.now() - lastChecked < SEVEN_DAYS_MS) {
@@ -1075,6 +1083,7 @@ class PlayerEngine {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 8000);
         for await (const event of api.streamLyrics(trackId, controller.signal)) {
+          if (cacheGeneration !== lyricsCache.getGeneration()) break;
           if (event.type === "provider" && event.status === "found") {
             const candidate = event.candidate;
             if (shouldCacheLyricsCandidate(candidate)) {
@@ -1095,7 +1104,11 @@ class PlayerEngine {
         }
         clearTimeout(timeout);
 
-        if (bestCandidate && shouldCacheLyricsCandidate(bestCandidate)) {
+        if (
+          cacheGeneration === lyricsCache.getGeneration() &&
+          bestCandidate &&
+          shouldCacheLyricsCandidate(bestCandidate)
+        ) {
           lyricsCache.set(trackId, bestCandidate, providers);
           void linerDb.putLyrics({
             trackId,
@@ -1125,6 +1138,9 @@ class PlayerEngine {
 
     if (!track) {
       this.currentLyricsTrackId = null;
+      this.lyricsLoadToken += 1;
+      this.lyricsAbort?.abort();
+      this.lyricsAbort = null;
       lyricsStore.reset();
       return;
     }
@@ -1139,6 +1155,7 @@ class PlayerEngine {
 
     this.currentLyricsTrackId = trackId;
     const token = ++this.lyricsLoadToken;
+    const cacheGeneration = lyricsCache.getGeneration();
     this.lyricsAbort?.abort();
     const controller = new AbortController();
     this.lyricsAbort = controller;
@@ -1153,6 +1170,8 @@ class PlayerEngine {
         cached = null;
       }
     }
+
+    if (token !== this.lyricsLoadToken || controller.signal.aborted) return;
 
     if (cached && cached.candidate) {
       bestCandidate = cached.candidate;
@@ -1210,6 +1229,7 @@ class PlayerEngine {
         await this.inFlightLyricsPrefetches.get(trackId);
         if (token !== this.lyricsLoadToken || controller.signal.aborted) return;
         const freshCached = lyricsCache.get(trackId) || (await linerDb.getLyrics(trackId));
+        if (token !== this.lyricsLoadToken || controller.signal.aborted) return;
         if (freshCached && freshCached.candidate) {
           const parsed = parseRawLyrics(
             freshCached.candidate.lyrics.content,
@@ -1256,7 +1276,10 @@ class PlayerEngine {
           ].sort((a, b) => compareLyricsCandidates(a.candidate, b.candidate));
 
           // cache provider individually if it satisfies provider rules
-          if (shouldCacheLyricsCandidate(candidate)) {
+          if (
+            cacheGeneration === lyricsCache.getGeneration() &&
+            shouldCacheLyricsCandidate(candidate)
+          ) {
             lyricsCache.setProvider(trackId, candidate);
           }
 
@@ -1282,7 +1305,10 @@ class PlayerEngine {
               plainLyrics: parsed.plainLyrics,
               lyricsQuality: candidate.quality.total,
             });
-            if (shouldCacheLyricsCandidate(candidate)) {
+            if (
+              cacheGeneration === lyricsCache.getGeneration() &&
+              shouldCacheLyricsCandidate(candidate)
+            ) {
               lyricsCache.set(trackId, candidate, updatedProviders);
               void linerDb.putLyrics({
                 trackId,
@@ -1319,7 +1345,11 @@ class PlayerEngine {
             `provider ${event.provider} error: ${event.message}`,
           );
         } else if (event.type === "done") {
-          if (bestCandidate && shouldCacheLyricsCandidate(bestCandidate)) {
+          if (
+            cacheGeneration === lyricsCache.getGeneration() &&
+            bestCandidate &&
+            shouldCacheLyricsCandidate(bestCandidate)
+          ) {
             const currentProviders = useLyricsStore.getState().availableProviders;
             lyricsCache.set(trackId, bestCandidate, currentProviders);
             void linerDb.putLyrics({

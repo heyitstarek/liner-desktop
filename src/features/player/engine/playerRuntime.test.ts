@@ -218,3 +218,31 @@ describe("PlayerRuntime audio caching", () => {
     expect(usePlayerStore.getState().status).toBe("playing");
   });
 });
+
+describe("PlayerRuntime pending seeks", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does not apply an old pending seek after the audio source changes", () => {
+    const audio = (playerRuntime as any).audio as HTMLAudioElement;
+    Object.defineProperty(audio, "readyState", {
+      value: 0,
+      configurable: true,
+    });
+    Object.defineProperty(audio, "currentTime", {
+      value: 0,
+      writable: true,
+      configurable: true,
+    });
+    audio.src = "blob:old-track";
+
+    playerRuntime!.setPendingSeek(25_000);
+    vi.spyOn(linerDb, "getAudio").mockResolvedValue(null);
+    vi.spyOn(api, "createPlaybackSession").mockReturnValue(new Promise(() => {}) as never);
+    void playerRuntime!.loadAndPlay({ ...track, id: "new-track" });
+    audio.dispatchEvent(new Event("loadedmetadata"));
+
+    expect(audio.currentTime).toBe(0);
+  });
+});
