@@ -59,6 +59,10 @@ export function useListReorder<T>({
   onReorderRef.current = onReorder;
 
   const autoScrollRafRef = useRef<number | null>(null);
+  const activePointerCleanupRef = useRef<(() => void) | null>(null);
+  const mountedRef = useRef(true);
+  const clickSuppressionRef = useRef<{ handler: (event: MouseEvent) => void; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const originalBodyStylesRef = useRef<{ cursor: string; userSelect: string } | null>(null);
 
   const calculateDropIndex = useCallback(
     (clientY: number, currentDrop: number | null): number => {
@@ -141,6 +145,7 @@ export function useListReorder<T>({
   const handleCardGrab = useCallback(
     (index: number, item: T, e: React.PointerEvent<HTMLDivElement>) => {
       if (e.button !== 0) return;
+      activePointerCleanupRef.current?.();
 
       const target = e.target as HTMLElement;
       if (
@@ -192,6 +197,10 @@ export function useListReorder<T>({
           setGrabOffset({ x: offsetX, y: offsetY });
           setItemWidth(width);
 
+          originalBodyStylesRef.current = {
+            cursor: document.body.style.cursor,
+            userSelect: document.body.style.userSelect,
+          };
           document.body.style.cursor = "grabbing";
           document.body.style.userSelect = "none";
 
@@ -208,17 +217,25 @@ export function useListReorder<T>({
         }
       };
 
-      const onPointerUp = () => {
+      const removePointerListeners = () => {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
         window.removeEventListener("pointercancel", onPointerUp);
+        if (activePointerCleanupRef.current === cancelDrag) activePointerCleanupRef.current = null;
+      };
+
+      const finishDrag = (cancelled: boolean) => {
+        removePointerListeners();
 
         stopAutoScroll();
 
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
+        if (originalBodyStylesRef.current) {
+          document.body.style.cursor = originalBodyStylesRef.current.cursor;
+          document.body.style.userSelect = originalBodyStylesRef.current.userSelect;
+          originalBodyStylesRef.current = null;
+        }
 
-        if (hasActivated) {
+        if (hasActivated && !cancelled) {
           const from = dragIndexRef.current;
           const to = dropIndexRef.current;
           const moving = draggedItemRef.current;
@@ -237,12 +254,16 @@ export function useListReorder<T>({
             once: true,
           });
 
-          setTimeout(() => {
+          const timer = setTimeout(() => {
             window.removeEventListener("click", suppressClick, true);
+            if (clickSuppressionRef.current?.handler === suppressClick) clickSuppressionRef.current = null;
             if (typeof window !== "undefined") {
               window.__linerWasDragging = false;
             }
           }, 400);
+          clickSuppressionRef.current = { handler: suppressClick, timer };
+        } else if (hasActivated) {
+          window.__linerWasDragging = false;
         }
 
         hasActivated = false;
@@ -251,11 +272,17 @@ export function useListReorder<T>({
         dropIndexRef.current = null;
         draggedItemRef.current = null;
 
-        setIsDragging(false);
-        setDragIndex(null);
-        setDropIndex(null);
-        setDraggedItem(null);
+        if (mountedRef.current) {
+          setIsDragging(false);
+          setDragIndex(null);
+          setDropIndex(null);
+          setDraggedItem(null);
+        }
       };
+
+      const onPointerUp = (event: PointerEvent) => finishDrag(event.type === "pointercancel");
+      const cancelDrag = () => finishDrag(true);
+      activePointerCleanupRef.current = cancelDrag;
 
       window.addEventListener("pointermove", onPointerMove);
       window.addEventListener("pointerup", onPointerUp);
@@ -265,10 +292,18 @@ export function useListReorder<T>({
   );
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      activePointerCleanupRef.current?.();
+      activePointerCleanupRef.current = null;
       stopAutoScroll();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
+      if (clickSuppressionRef.current) {
+        window.removeEventListener("click", clickSuppressionRef.current.handler, true);
+        clearTimeout(clickSuppressionRef.current.timer);
+        clickSuppressionRef.current = null;
+      }
+      if (typeof window !== "undefined") window.__linerWasDragging = false;
     };
   }, [stopAutoScroll]);
 

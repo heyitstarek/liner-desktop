@@ -144,18 +144,18 @@ export function preloadCoverArt(url: string | undefined): Promise<void> {
   img.decoding = "async";
 
   // mint and sign proxy fallback in parallel with direct cdn load
-  void prepareCoverFallback(url);
+  void prepareCoverFallback(url).catch(() => undefined);
 
+  let entry!: CoverEntry;
   const promise = new Promise<void>((resolve) => {
     let triedFallback = false;
     const settle = (status: CoverStatus, effectiveUrl?: string) => {
-      const entry = entries.get(url);
-      if (entry) {
+      if (entries.get(url) === entry) {
         entry.status = status;
         if (effectiveUrl) entry.effectiveUrl = effectiveUrl;
         if (status === "loaded") entry.element = img;
+        notify(url);
       }
-      notify(url);
       resolve();
     };
     img.onload = () => settle("loaded", img.src);
@@ -167,16 +167,21 @@ export function preloadCoverArt(url: string | undefined): Promise<void> {
       if (!triedFallback) {
         triedFallback = true;
         void prepareCoverFallback(url).then((fallback) => {
+          if (entries.get(url) !== entry) {
+            resolve();
+            return;
+          }
           if (fallback) img.src = fallback;
           else settle("error");
-        });
+        }).catch(() => settle("error"));
         return;
       }
       settle("error");
     };
   });
 
-  entries.set(url, { status: "loading", promise });
+  entry = { status: "loading", promise, element: img };
+  entries.set(url, entry);
   img.src = url;
   return promise;
 }

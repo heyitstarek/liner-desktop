@@ -35,6 +35,7 @@ export function useSearchTracks(
   const shouldRunSearch = enabled && trimmed.length >= 2;
 
   const runRequest = useCallback(async (requestId: number, q: string) => {
+    if (requestId !== latestRequestIdRef.current) return;
     setLoading(true);
     try {
       const res = await api.search(q, "track");
@@ -62,8 +63,8 @@ export function useSearchTracks(
   }, []);
 
   useEffect(() => {
-    if (trimmed.length < 2) {
-      latestRequestIdRef.current += 1;
+    const requestId = ++latestRequestIdRef.current;
+    if (trimmed.length < 2 || !enabled) {
       setTracks([]);
       setHasLoaded(false);
       setLoading(false);
@@ -73,29 +74,28 @@ export function useSearchTracks(
       return;
     }
 
-    if (!enabled) return;
-
-    if (lastFetchedQueryRef.current === trimmed && tracks.length > 0) {
+    if (lastFetchedQueryRef.current === trimmed) {
       setLoading(false);
       setHasLoaded(true);
       return;
     }
 
+    lastFetchedQueryRef.current = "";
+    setTracks([]);
+    setHasLoaded(false);
+    setError(null);
+    setPartialWarning(undefined);
     setLoading(true);
-    const requestId = ++latestRequestIdRef.current;
     const timer = setTimeout(() => {
-      if (lastFetchedQueryRef.current === trimmed && tracks.length > 0) {
-        setLoading(false);
-        setHasLoaded(true);
-        return;
-      }
+      if (requestId !== latestRequestIdRef.current) return;
       void runRequest(requestId, trimmed);
     }, debounceMs);
 
     return () => {
       clearTimeout(timer);
+      if (latestRequestIdRef.current === requestId) latestRequestIdRef.current++;
     };
-  }, [debounceMs, enabled, runRequest, tracks.length, trimmed]);
+  }, [debounceMs, enabled, runRequest, trimmed]);
 
   const runNow = useCallback(() => {
     if (!shouldRunSearch) return;

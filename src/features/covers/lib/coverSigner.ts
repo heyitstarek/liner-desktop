@@ -25,7 +25,10 @@ function isElectron(): boolean {
 }
 
 function base64UrlEncode(input: string): string {
-  return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /**
@@ -68,7 +71,7 @@ async function computeFallback(coverUrl: string): Promise<string | undefined> {
     return undefined;
   }
   const payload = base64UrlEncode(
-    JSON.stringify({ u: sizeAgnosticUrl(coverUrl, parsed.hostname), s: COVER_PROXY_SIZE }),
+    JSON.stringify({ u: sizeAgnosticUrl(parsed.href, parsed.hostname), s: COVER_PROXY_SIZE }),
   );
   const token = await signCoverUrl(payload);
   return getCoverProxyUrl(token, COVER_PROXY_SIZE);

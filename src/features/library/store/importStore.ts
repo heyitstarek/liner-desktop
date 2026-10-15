@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api, type ImportJob, type ImportReview } from "@/shared/api";
+import { getAuthSessionIdentity } from "@/shared/api/auth-session";
 import { showToast } from "@/shared/ui";
 import { createTranslatorSync, getStoredLocale } from "@/languages";
 import { notifyLibraryChanged } from "../hooks/usePlaylists";
@@ -22,6 +23,18 @@ export interface ActiveImportState {
 let activeWebSocket: WebSocket | null = null;
 let activeAbortController: AbortController | null = null;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let operationGeneration = 0;
+let observedIdentity = getAuthSessionIdentity();
+
+function isCurrentOperation(generation: number, identity: string) {
+  return generation === operationGeneration && identity === getAuthSessionIdentity();
+}
+
+function invalidateOperation() {
+  operationGeneration++;
+  cleanupActiveConnections();
+  return operationGeneration;
+}
 
 function cleanupActiveConnections() {
   if (activeWebSocket) {
@@ -53,7 +66,7 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
   approvedTracks: null,
 
   reset: () => {
-    cleanupActiveConnections();
+    invalidateOperation();
     set({
       job: null,
       isPolling: false,
@@ -65,12 +78,15 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
   },
 
   cancelPolling: () => {
-    cleanupActiveConnections();
-    set({ isPolling: false });
+    invalidateOperation();
+    set({ isPolling: false, pendingTrack: null });
   },
 
   startImport: async (url: string, pendingTrack: TrackDetail | null = null) => {
     get().cancelPolling();
+    const generation = operationGeneration;
+    const identity = getAuthSessionIdentity();
+    observedIdentity = identity;
     set({
       error: null,
       isPolling: true,
@@ -80,6 +96,7 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
     });
     try {
       const job = await api.createPlaylistImport(url);
+      if (!isCurrentOperation(generation, identity)) return job;
       set({ job });
 
       // direct imports (e.g. soundcloud) complete immediately on backend without external worker
@@ -98,13 +115,17 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
       }
       return job;
     } catch (err) {
+      if (!isCurrentOperation(generation, identity)) throw err;
       set({ error: "Failed to start import", isPolling: false, pendingTrack: null });
       throw err;
     }
   },
 
   listenToWebSocketWorker: (job: ImportJob) => {
-    cleanupActiveConnections();
+    invalidateOperation();
+    const generation = operationGeneration;
+    const identity = getAuthSessionIdentity();
+    observedIdentity = identity;
     set({ isPolling: true });
 
     let isFinished = false;
@@ -112,6 +133,13 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
 
     try {
       const wsUrl = new URL(job.workerWsUrl!);
+      if (wsUrl.username || wsUrl.password) throw new Error("Worker URL credentials are not allowed");
+      const isLoopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(wsUrl.hostname.toLowerCase());
+      const isLocalDevelopment = import.meta.env.DEV && isLoopback;
+      if (wsUrl.protocol !== "wss:" && wsUrl.protocol !== "https:" &&
+          !(isLocalDevelopment && (wsUrl.protocol === "ws:" || wsUrl.protocol === "http:"))) {
+        throw new Error("Worker transport must be secure");
+      }
       wsUrl.searchParams.set("token", job.importToken!);
       const protocol = wsUrl.protocol === "https:" ? "wss:" : wsUrl.protocol === "http:" ? "ws:" : wsUrl.protocol;
       const targetUrl = `${protocol}//${wsUrl.host}${wsUrl.pathname}${wsUrl.search}`;
@@ -125,6 +153,7 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
     }
 
     ws.onmessage = (event) => {
+      if (!isCurrentOperation(generation, identity)) return;
       try {
         const msg = JSON.parse(event.data);
         if (!msg || typeof msg !== "object") return;
@@ -181,16 +210,21 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
             if (!current.playlistId) {
               void (async () => {
                 for (let i = 0; i < 20; i++) {
+                  if (!isCurrentOperation(generation, identity)) return;
                   try {
                     const synced = await api.getPlaylistImport(job.id);
+                    if (!isCurrentOperation(generation, identity)) return;
                     if (synced.playlistId) {
                       set({ isPolling: false, job: synced });
                       notifyLibraryChanged();
                       return;
                     }
-                  } catch {}
+                  } catch {
+                    if (!isCurrentOperation(generation, identity)) return;
+                  }
                   await new Promise((r) => setTimeout(r, 800));
                 }
+                if (!isCurrentOperation(generation, identity)) return;
                 set({ isPolling: false, job: current });
                 notifyLibraryChanged();
               })();
@@ -212,7 +246,7 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
     };
 
     ws.onerror = () => {
-      if (isFinished) return;
+      if (isFinished || !isCurrentOperation(generation, identity)) return;
       cleanupActiveConnections();
       set((prev) => ({
         isPolling: false,
@@ -222,7 +256,7 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
     };
 
     ws.onclose = () => {
-      if (isFinished) return;
+      if (isFinished || !isCurrentOperation(generation, identity)) return;
       cleanupActiveConnections();
       set((prev) => ({
         isPolling: false,
@@ -233,59 +267,100 @@ export const useImportStore = create<ActiveImportState>((set, get) => ({
   },
 
   pollJob: async (jobId: string) => {
-    if (pollTimer) clearTimeout(pollTimer);
-
-    try {
-      const current = await api.getPlaylistImport(jobId);
-      set({ job: current });
-
-      if (current.status === "awaiting_decision") {
-        set({ isPolling: false, job: current });
-        return;
-      }
-
-      if (current.status === "completed") {
-        set({ isPolling: false, job: current });
-        notifyLibraryChanged();
-        return;
-      }
-
-      if (current.status === "failed") {
-        set({ isPolling: false, job: current, error: "Import failed" });
-        return;
-      }
-
-      pollTimer = setTimeout(() => {
-        void get().pollJob(jobId);
-      }, 1000);
-    } catch {
-      pollTimer = setTimeout(() => {
-        void get().pollJob(jobId);
-      }, 2500);
-    }
+    const generation = invalidateOperation();
+    const identity = getAuthSessionIdentity();
+    observedIdentity = identity;
+    set({ isPolling: true });
+    await pollJobForGeneration(jobId, generation, identity, set);
   },
 }));
 
-let lastHandledCompletedJobId: string | null = null;
+async function pollJobForGeneration(
+  jobId: string,
+  generation: number,
+  identity: string,
+  set: (partial: Partial<ActiveImportState>) => void,
+): Promise<void> {
+  try {
+    const current = await api.getPlaylistImport(jobId);
+    if (!isCurrentOperation(generation, identity)) return;
+    set({ job: current });
+
+    if (current.status === "awaiting_decision") {
+      set({ isPolling: false, job: current });
+      return;
+    }
+
+    if (current.status === "completed") {
+      set({ isPolling: false, job: current });
+      notifyLibraryChanged();
+      return;
+    }
+
+    if (current.status === "failed") {
+      set({ isPolling: false, job: current, error: "Import failed" });
+      return;
+    }
+
+    pollTimer = setTimeout(() => {
+      if (isCurrentOperation(generation, identity)) {
+        void pollJobForGeneration(jobId, generation, identity, set);
+      }
+    }, 1000);
+  } catch {
+    if (!isCurrentOperation(generation, identity)) return;
+    pollTimer = setTimeout(() => {
+      if (isCurrentOperation(generation, identity)) {
+        void pollJobForGeneration(jobId, generation, identity, set);
+      }
+    }, 2500);
+  }
+}
+
+let lastHandledCompletedJob: { id: string; generation: number } | null = null;
 
 useImportStore.subscribe((state) => {
   const { job, pendingTrack } = state;
   if (!job || job.status !== "completed" || !job.playlistId || !pendingTrack) return;
-  if (job.id === lastHandledCompletedJobId) return;
-  lastHandledCompletedJobId = job.id;
+  const generation = operationGeneration;
+  const identity = getAuthSessionIdentity();
+  if (lastHandledCompletedJob?.id === job.id && lastHandledCompletedJob.generation === generation) return;
+  lastHandledCompletedJob = { id: job.id, generation };
 
   useImportStore.setState({ pendingTrack: null });
 
   void (async () => {
     const translate = createTranslatorSync(getStoredLocale());
     try {
+      if (!isCurrentOperation(generation, identity)) return;
       await api.addPlaylistTrack(job.playlistId as string, pendingTrack.id);
+      if (!isCurrentOperation(generation, identity)) return;
       notifyLibraryChanged();
       showToast(translate("common.added_to_playlist"), "checkmark", {
         description: pendingTrack.title || undefined,
       });
     } catch {
-      showToast(translate("common.failed_add_playlist"), "error");
+      if (isCurrentOperation(generation, identity)) {
+        showToast(translate("common.failed_add_playlist"), "error");
+      }
     }
   })();
 });
+
+if (typeof window !== "undefined") {
+  window.addEventListener("auth:changed", () => {
+    const identity = getAuthSessionIdentity();
+    if (identity === observedIdentity) return;
+    observedIdentity = identity;
+    invalidateOperation();
+    lastHandledCompletedJob = null;
+    useImportStore.setState({
+      job: null,
+      isPolling: false,
+      error: null,
+      pendingTrack: null,
+      reviewItems: null,
+      approvedTracks: null,
+    });
+  });
+}

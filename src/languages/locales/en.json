@@ -548,9 +548,9 @@
     },
     "telemetry": {
       "title": "Anonymous Telemetry & Diagnostics",
-      "description": "Helps identify and fix playback errors, buffering stalls, and network issues. Never collects personal data, tokens, passwords, or local file paths.",
+      "description": "This controls diagnostic reporting only; listening history is still sent to Liner for recommendations.",
       "enabled": "Anonymous telemetry enabled",
-      "disabled": "Telemetry completely disabled"
+      "disabled": "Diagnostic telemetry disabled"
     },
     "cache": {
       "title": "Cache & Storage",

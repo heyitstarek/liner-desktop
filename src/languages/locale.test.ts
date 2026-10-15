@@ -44,6 +44,27 @@ describe("locale", () => {
     localStorage.setItem("liner_locale", "de");
     expect(getStoredLocale()).toBe("en");
   });
+
+  it("falls back to browser locale when the localStorage getter is denied", () => {
+    vi.stubGlobal("window", {
+      get localStorage() { throw new DOMException("Storage is unavailable", "SecurityError"); },
+      navigator: { language: "en-US", languages: ["en-US"] },
+    });
+    expect(getStoredLocale()).toBe("en");
+    expect(() => storeLocale("uk")).not.toThrow();
+  });
+
+  it("falls back safely when localStorage read and write operations are denied", () => {
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem() { throw new DOMException("Read denied", "SecurityError"); },
+        setItem() { throw new DOMException("Write denied", "SecurityError"); },
+      },
+      navigator: { language: "ru-RU", languages: ["ru-RU"] },
+    });
+    expect(getStoredLocale()).toBe("ru");
+    expect(() => storeLocale("uk")).not.toThrow();
+  });
 });
 
 describe("getBrowserLocale", () => {

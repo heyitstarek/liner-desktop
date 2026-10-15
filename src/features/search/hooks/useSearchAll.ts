@@ -31,6 +31,7 @@ export function useSearchAll(
 
   const runRequest = useCallback(
     async (requestId: number, q: string) => {
+      if (requestId !== latestRequestIdRef.current) return;
       setLoading(true);
       try {
         const res = await api.search(q, "all");
@@ -52,8 +53,8 @@ export function useSearchAll(
   );
 
   useEffect(() => {
-    if (trimmed.length < 2) {
-      latestRequestIdRef.current += 1;
+    const requestId = ++latestRequestIdRef.current;
+    if (trimmed.length < 2 || !options.enabled) {
       setItems([]);
       setHasLoaded(false);
       setLoading(false);
@@ -62,29 +63,27 @@ export function useSearchAll(
       return;
     }
 
-    if (!options.enabled) return;
-
-    if (lastFetchedQueryRef.current === trimmed && items.length > 0) {
+    if (lastFetchedQueryRef.current === trimmed) {
       setLoading(false);
       setHasLoaded(true);
       return;
     }
 
+    lastFetchedQueryRef.current = "";
+    setItems([]);
+    setHasLoaded(false);
+    setPartialWarning(undefined);
     setLoading(true);
-    const requestId = ++latestRequestIdRef.current;
     const timer = setTimeout(() => {
-      if (lastFetchedQueryRef.current === trimmed && items.length > 0) {
-        setLoading(false);
-        setHasLoaded(true);
-        return;
-      }
+      if (requestId !== latestRequestIdRef.current) return;
       void runRequest(requestId, trimmed);
     }, options.debounceMs ?? 320);
 
     return () => {
       clearTimeout(timer);
+      if (latestRequestIdRef.current === requestId) latestRequestIdRef.current++;
     };
-  }, [items.length, options.debounceMs, options.enabled, runRequest, trimmed]);
+  }, [options.debounceMs, options.enabled, runRequest, trimmed]);
 
   const runNow = useCallback(() => {
     if (!shouldRunSearch) return;

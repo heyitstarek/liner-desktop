@@ -2,9 +2,25 @@ export type Locale = "en" | "ru" | "uk";
 
 const LOCALE_STORAGE_KEY = "liner_locale";
 
+function getLocaleStorage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getStoredLocale(): Locale {
-  if (typeof window === "undefined" || !window.localStorage) return "en";
-  const stored = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  if (typeof window === "undefined") return "en";
+  const storage = getLocaleStorage();
+  if (!storage) return getBrowserLocale();
+  let stored: string | null;
+  try {
+    stored = storage.getItem(LOCALE_STORAGE_KEY);
+  } catch {
+    return getBrowserLocale();
+  }
   if (stored === "en" || stored === "ru" || stored === "uk") return stored;
   // Handle legacy stored 'ua'
   if (stored === "ua") {
@@ -15,9 +31,8 @@ export function getStoredLocale(): Locale {
 }
 
 export function storeLocale(locale: Locale): void {
-  if (typeof window !== "undefined") {
-    window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
-  }
+  const storage = getLocaleStorage();
+  try { storage?.setItem(LOCALE_STORAGE_KEY, locale); } catch {}
 }
 
 export function getBrowserLocale(): Locale {

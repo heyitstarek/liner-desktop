@@ -38,6 +38,19 @@ export function useHorizontalScroll(
   const scrollLeft = useRef(0);
   const animId = useRef<number | null>(null);
   const dragSamples = useRef<Array<{ x: number; time: number }>>([]);
+  const cancelDragRef = useRef<(() => void) | null>(null);
+  const originalStylesRef = useRef<{ bodyCursor: string; bodyUserSelect: string; elementCursor: string } | null>(null);
+
+  const restoreDragStyles = useCallback(() => {
+    const original = originalStylesRef.current;
+    if (original) {
+      document.body.style.cursor = original.bodyCursor;
+      document.body.style.userSelect = original.bodyUserSelect;
+      const element = scrollRef.current;
+      if (element) element.style.cursor = original.elementCursor;
+      originalStylesRef.current = null;
+    }
+  }, []);
 
   const checkScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -84,14 +97,15 @@ export function useHorizontalScroll(
 
   useEffect(() => {
     return () => {
-      document.body.style.removeProperty("cursor");
-      document.body.style.removeProperty("user-select");
+      cancelDragRef.current?.();
+      cancelDragRef.current = null;
+      restoreDragStyles();
       if (animId.current !== null) {
         cancelAnimationFrame(animId.current);
         animId.current = null;
       }
     };
-  }, []);
+  }, [restoreDragStyles]);
 
   const onMouseDown = useCallback(
     (event: MouseEvent<HTMLDivElement>) => {
@@ -104,6 +118,7 @@ export function useHorizontalScroll(
         animId.current = null;
         suppressClick.current = true;
       }
+      cancelDragRef.current?.();
 
       isMouseDown.current = true;
       hasDragged.current = false;
@@ -117,6 +132,11 @@ export function useHorizontalScroll(
         const delta = e.pageX - startX.current;
         if (!hasDragged.current && Math.abs(delta) > 5) {
           hasDragged.current = true;
+          originalStylesRef.current = {
+            bodyCursor: document.body.style.cursor,
+            bodyUserSelect: document.body.style.userSelect,
+            elementCursor: el.style.cursor,
+          };
           el.style.cursor = dragCursor;
           document.body.style.cursor = dragCursor;
           document.body.style.userSelect = "none";
@@ -130,17 +150,38 @@ export function useHorizontalScroll(
         }
       };
 
+      const removeTransientListeners = () => {
+        window.removeEventListener("mousemove", onWindowMouseMove);
+        window.removeEventListener("mouseup", onWindowMouseUp);
+        window.removeEventListener("blur", onWindowBlur);
+        if (cancelDragRef.current === cancelDrag) cancelDragRef.current = null;
+      };
+
+      const cancelDrag = () => {
+        if (!isMouseDown.current) {
+          removeTransientListeners();
+          return;
+        }
+        isMouseDown.current = false;
+        hasDragged.current = false;
+        dragSamples.current = [];
+        removeTransientListeners();
+        restoreDragStyles();
+        if (animId.current !== null) {
+          cancelAnimationFrame(animId.current);
+          animId.current = null;
+        }
+      };
+
+      const onWindowBlur = () => cancelDrag();
+      cancelDragRef.current = cancelDrag;
+
       const onWindowMouseUp = () => {
         if (!isMouseDown.current) return;
         isMouseDown.current = false;
-        window.removeEventListener("mousemove", onWindowMouseMove);
-        window.removeEventListener("mouseup", onWindowMouseUp);
+        removeTransientListeners();
 
-        document.body.style.removeProperty("cursor");
-        document.body.style.removeProperty("user-select");
-        if (el) {
-          el.style.removeProperty("cursor");
-        }
+        restoreDragStyles();
 
         if (hasDragged.current) {
           suppressClick.current = true;
@@ -198,8 +239,9 @@ export function useHorizontalScroll(
 
       window.addEventListener("mousemove", onWindowMouseMove);
       window.addEventListener("mouseup", onWindowMouseUp);
+      window.addEventListener("blur", onWindowBlur);
     },
-    [dragCursor],
+    [dragCursor, restoreDragStyles],
   );
 
   const onClickCapture = useCallback((event: MouseEvent<HTMLDivElement>) => {

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Gallery,
   TrashBin2,
@@ -33,6 +33,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
   const { t } = useTranslation();
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileReadGeneration = useRef(0);
   const [activeBlock, setActiveBlock] = useState<BlockTarget>("contentView");
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -51,6 +52,8 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
   const resetBlock = useCustomizationStore((s) => s.resetBlock);
   const resetAll = useCustomizationStore((s) => s.resetAll);
 
+  useEffect(() => () => { fileReadGeneration.current++; }, []);
+
   const { resolvedTheme } = useTheme();
   const isDark =
     resolvedTheme
@@ -62,6 +65,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
 
   const handleFileChange = useCallback(
     (file: File) => {
+      const generation = ++fileReadGeneration.current;
       if (!file.type.startsWith("image/")) {
         toast(t("settings.customization.invalid_file_type") || "Please select an image or GIF file", "error");
         return;
@@ -73,6 +77,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
 
       const reader = new FileReader();
       reader.onload = () => {
+        if (generation !== fileReadGeneration.current) return;
         const result = reader.result as string;
         if (result) {
           setBackgroundImage(result);
@@ -88,6 +93,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
         }
       };
       reader.onerror = () => {
+        if (generation !== fileReadGeneration.current) return;
         toast(t("settings.customization.read_error") || "Failed to read image file", "error");
       };
       reader.readAsDataURL(file);
@@ -172,6 +178,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
                     variant="secondary"
                     size="sm"
                     onClick={() => {
+                      fileReadGeneration.current++;
                       setBackgroundImage(null);
                       toast(t("settings.customization.removed") || "Wallpaper removed", "info");
                     }}
@@ -394,6 +401,7 @@ export function CustomizationTab({ searchQuery }: { searchQuery?: string }) {
               variant="secondary"
               size="sm"
               onClick={() => {
+                fileReadGeneration.current++;
                 resetAll();
                 toast(t("settings.customization.all_reset") || "Customization reset", "info");
               }}

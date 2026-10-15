@@ -19,7 +19,24 @@ export default function CoverImage({
   const [retryCount, setRetryCount] = useState(0);
   const [corsMode, setCorsMode] = useState<ImageProps["crossOrigin"]>(crossOrigin || undefined);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestGenerationRef = useRef(0);
+  const renderedSrcRef = useRef(src);
+  const mountedRef = useRef(false);
+  if (renderedSrcRef.current !== src) {
+    renderedSrcRef.current = src;
+    requestGenerationRef.current++;
+  }
+  const sourceGeneration = requestGenerationRef.current;
 
+  const isCurrentSource = () =>
+    mountedRef.current &&
+    renderedSrcRef.current === src &&
+    requestGenerationRef.current === sourceGeneration;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   useEffect(() => {
     setLocalFallback(undefined);
     setRetryCount(0);
@@ -41,6 +58,7 @@ export default function CoverImage({
   const effectiveSrc = localFallback || centralSrc || src;
 
   const handleError = () => {
+    if (!isCurrentSource()) return;
     // If CORS mode failed (e.g. file:// origin in Electron or CDN lacks CORS headers),
     // immediately fallback to standard no-cors mode so artwork is never blank
     if (corsMode === "anonymous") {
@@ -49,6 +67,7 @@ export default function CoverImage({
     }
 
     void prepareCoverFallback(src).then((resolved) => {
+      if (!isCurrentSource()) return;
       if (resolved && resolved !== src) {
         setLocalFallback(resolved);
         return;
@@ -58,6 +77,7 @@ export default function CoverImage({
       if (retryCount < 2) {
         if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
         retryTimerRef.current = setTimeout(() => {
+          if (!isCurrentSource()) return;
           setRetryCount((prev) => prev + 1);
         }, 250);
       }
@@ -71,6 +91,7 @@ export default function CoverImage({
       src={effectiveSrc}
       crossOrigin={corsMode}
       onLoad={(event) => {
+        if (!isCurrentSource()) return;
         markCoverReady(src, effectiveSrc, event.currentTarget);
         onLoad?.(event);
       }}
