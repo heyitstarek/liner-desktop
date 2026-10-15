@@ -3,6 +3,10 @@
   "version": "0.1.35",
   "type": "module",
   "private": true,
+  "packageManager": "pnpm@10.34.7",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "description": "Liner Music Player",
   "author": {
     "name": "hkamori",
@@ -13,16 +17,17 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
     "bundle:publish": "pnpm --dir ../updater bundle:publish",
     "signer:build": "node ../signer/scripts/build-wasm.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:electron-sandbox": "pnpm run build && electron scripts/electron-sandbox-smoke.cjs",
     "test:watch": "vitest",
-    "electron:build": "tsc -b && vite build && electron-builder",
-    "electron:build:linux": "tsc -b && vite build && electron-builder --linux",
-    "electron:build:win": "tsc -b && vite build && electron-builder --win",
-    "electron:build:mac": "tsc -b && vite build && electron-builder --mac"
+    "electron:build": "tsc -b && vite build && electron-builder --publish never",
+    "electron:build:linux": "tsc -b && vite build && electron-builder --linux --publish never",
+    "electron:build:win": "tsc -b && vite build && electron-builder --win --publish never",
+    "electron:build:mac": "tsc -b && vite build && electron-builder --mac --publish never"
   },
   "build": {
     "appId": "com.hkamori.liner",

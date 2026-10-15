@@ -79,7 +79,8 @@ liner/desktop/
 
 ### Prerequisites
 
-- **Node.js** `v20+` and **pnpm** or **Bun**
+- **Node.js** `v22.13.0+` and **pnpm** `10.34.7` for installs from the committed lockfile
+- Bun may be used to run compatible local scripts
 - Modern OS (Windows 10/11, macOS, or Linux)
 
 ---

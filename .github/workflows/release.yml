@@ -8,11 +8,71 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  quality-gate:
+    name: Tests, typecheck, and build gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+  windows-smoke:
+    name: Windows Electron sandbox smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Electron runtime
+        run: node node_modules/electron/install.js
+
+      - name: Run isolated Electron smoke
+        run: pnpm test:electron-sandbox
+
   build-linux:
     name: Build Linux
+    needs: [quality-gate, windows-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,13 +81,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: 'pnpm'
+          node-version: 22.13.0
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -35,7 +95,6 @@ jobs:
       - name: Build Linux packages (AppImage & deb)
         run: pnpm run electron:build:linux
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VITE_API_URL: https://api.tryliner.fun
           VITE_COVERS_PROXY_URL: https://covers.tryliner.fun
 
@@ -50,6 +109,7 @@ jobs:
 
   build-windows:
     name: Build Windows
+    needs: [quality-gate, windows-smoke]
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -58,13 +118,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: 'pnpm'
+          node-version: 22.13.0
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -72,7 +132,6 @@ jobs:
       - name: Build Windows installer (NSIS)
         run: pnpm run electron:build:win
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VITE_API_URL: https://api.tryliner.fun
           VITE_COVERS_PROXY_URL: https://covers.tryliner.fun
 
@@ -86,6 +145,7 @@ jobs:
 
   build-macos:
     name: Build macOS
+    needs: [quality-gate, windows-smoke]
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -94,13 +154,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: 'pnpm'
+          node-version: 22.13.0
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -108,7 +168,6 @@ jobs:
       - name: Build macOS packages (DMG & ZIP)
         run: pnpm run electron:build:mac
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
           VITE_API_URL: https://api.tryliner.fun
           VITE_COVERS_PROXY_URL: https://covers.tryliner.fun
@@ -127,6 +186,8 @@ jobs:
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4

@@ -9,6 +9,32 @@ export interface GlobalErrorHandlerOptions {
 let isInitialized = false;
 let cleanupFn: (() => void) | null = null;
 
+function formatUnhandledReason(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+
+  const seen = new WeakSet<object>();
+  try {
+    const serialized = JSON.stringify(reason, (_key, value: unknown) => {
+      if (typeof value === "bigint") return `${value}n`;
+      if (value && typeof value === "object") {
+        if (seen.has(value)) return "[Circular]";
+        seen.add(value);
+      }
+      return value;
+    });
+    if (serialized !== undefined) return serialized;
+  } catch {
+    // Some rejection values cannot be serialized, but logging must still proceed.
+  }
+
+  try {
+    return String(reason);
+  } catch {
+    return "[Unserializable rejection reason]";
+  }
+}
+
 /**
  * Initializes global error and unhandled rejection listeners for the renderer process.
  * Safely captures and logs uncaught exceptions and unhandled promise rejections.
@@ -50,12 +76,7 @@ export function initGlobalErrorHandlers(
 
   const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
     const reason = event.reason;
-    const message =
-      reason instanceof Error
-        ? reason.message
-        : typeof reason === "string"
-          ? reason
-          : JSON.stringify(reason);
+    const message = formatUnhandledReason(reason);
 
     log(
       "red",

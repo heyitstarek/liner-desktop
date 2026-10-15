@@ -40,7 +40,9 @@ self.addEventListener("activate", (event) => {
       .keys()
       .then((keys) =>
         Promise.all(
-          keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)),
+          keys
+            .filter((k) => k.startsWith("liner-covers-") && k !== CACHE_NAME)
+            .map((k) => caches.delete(k)),
         ),
       )
       .then(() => self.clients.claim()),

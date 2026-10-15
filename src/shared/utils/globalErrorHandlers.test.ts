@@ -1,8 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { initGlobalErrorHandlers } from "./globalErrorHandlers";
 
+const { reportError } = vi.hoisted(() => ({
+  reportError: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("./logger", () => ({ log: vi.fn() }));
+vi.mock("@/shared/telemetry", () => ({
+  telemetry: { reportError },
+}));
+
 describe("initGlobalErrorHandlers", () => {
   let cleanup: (() => void) | null = null;
+
+  beforeEach(() => {
+    reportError.mockClear();
+  });
 
   afterEach(() => {
     if (cleanup) {
@@ -44,6 +57,20 @@ describe("initGlobalErrorHandlers", () => {
 
     expect(onUnhandledRejectionMock).toHaveBeenCalledTimes(1);
     expect(onUnhandledRejectionMock).toHaveBeenCalledWith(rejectionEvent);
+  });
+
+  it.each([
+    ["cyclic objects", (() => { const value: Record<string, unknown> = {}; value.self = value; return value; })()],
+    ["BigInt values", 1n],
+  ])("reports unhandled rejection reasons containing %s", (_label, reason) => {
+    const onUnhandledRejectionMock = vi.fn();
+    cleanup = initGlobalErrorHandlers({ onUnhandledRejection: onUnhandledRejectionMock });
+    const rejectionEvent = new CustomEvent("unhandledrejection", { detail: { reason } }) as any;
+    rejectionEvent.reason = reason;
+
+    expect(() => window.dispatchEvent(rejectionEvent)).not.toThrow();
+    expect(onUnhandledRejectionMock).toHaveBeenCalledTimes(1);
+    expect(reportError).toHaveBeenCalledTimes(1);
   });
 
   it("cleans up listeners when cleanup function is invoked", () => {
