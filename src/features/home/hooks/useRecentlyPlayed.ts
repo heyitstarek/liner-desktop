@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, toClientTrack } from "@/shared/api";
+import { api, getAuthSessionIdentity, toClientTrack } from "@/shared/api";
 import type { PopularItem } from "./usePopularTracks";
 
 export const recentlyPlayedKeys = {
@@ -10,15 +10,35 @@ const cache = new Map<string, { data: PopularItem[]; timestamp: number }>();
 const CACHE_TTL = 60_000;
 
 export function useRecentlyPlayed(limit = 20) {
+  const [authRevision, setAuthRevision] = useState(0);
+  const identity = getAuthSessionIdentity();
+  const cacheKey = `${identity}:recent_${limit}`;
   const [data, setData] = useState<PopularItem[]>(
-    () => cache.get(`recent_${limit}`)?.data ?? [],
+    () => cache.get(cacheKey)?.data ?? [],
   );
   const [isLoading, setIsLoading] = useState(
-    () => !cache.has(`recent_${limit}`),
+    () => !cache.has(cacheKey),
   );
 
   useEffect(() => {
-    const cached = cache.get(`recent_${limit}`);
+    const onAuthChanged = () => {
+      setData([]);
+      setIsLoading(true);
+      setAuthRevision((revision) => revision + 1);
+    };
+    window.addEventListener("auth:changed", onAuthChanged);
+    return () => window.removeEventListener("auth:changed", onAuthChanged);
+  }, []);
+
+  useEffect(() => {
+    const requestIdentity = getAuthSessionIdentity();
+    const key = `${requestIdentity}:recent_${limit}`;
+    if (requestIdentity === "anonymous") {
+      setData([]);
+      setIsLoading(false);
+      return;
+    }
+    const cached = cache.get(key);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       setData(cached.data);
       setIsLoading(false);
@@ -30,7 +50,7 @@ export function useRecentlyPlayed(limit = 20) {
     api
       .getHistory(undefined, fetchLimit)
       .then((res) => {
-        if (!active) return;
+        if (!active || requestIdentity !== getAuthSessionIdentity()) return;
         const seen = new Set<string>();
         const items: PopularItem[] = [];
         for (const entry of res.items || []) {
@@ -74,20 +94,20 @@ export function useRecentlyPlayed(limit = 20) {
             break;
           }
         }
-        cache.set(`recent_${limit}`, { data: items, timestamp: Date.now() });
+        cache.set(key, { data: items, timestamp: Date.now() });
         setData(items);
       })
       .catch(() => {
-        if (active) setData([]);
+        if (active && requestIdentity === getAuthSessionIdentity()) setData([]);
       })
       .finally(() => {
-        if (active) setIsLoading(false);
+        if (active && requestIdentity === getAuthSessionIdentity()) setIsLoading(false);
       });
 
     return () => {
       active = false;
     };
-  }, [limit]);
+  }, [limit, identity, authRevision]);
 
   return { data, isLoading };
 }

@@ -3,8 +3,10 @@ import React from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createRoot, Root } from "react-dom/client";
 import { act } from "react";
-import { useLikedTracks, applyOptimisticLike } from "./useLikedTracks";
+import { useLikedTracks, applyOptimisticLike, applyOptimisticUnlike } from "./useLikedTracks";
 import { api } from "@/shared/api";
+
+const mocks = vi.hoisted(() => ({ session: { accessToken: "test-token", user: { id: "u1" } } as any, boundary: 1 }));
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -12,7 +14,10 @@ vi.mock("@/shared/api", () => ({
   api: {
     listLikedTracks: vi.fn(),
   },
-  getAuthSession: () => ({ accessToken: "test-token", user: { id: "u1" } }),
+  getAuthSession: () => mocks.session,
+  getAuthSessionIdentity: () => mocks.session?.accessToken
+    ? mocks.session.user?.id ? `user:${mocks.session.user.id}` : `token:${mocks.session.accessToken}`
+    : "anonymous",
   toClientTrack: (track: any) => ({
     id: track.id,
     title: track.title,
@@ -21,6 +26,10 @@ vi.mock("@/shared/api", () => ({
     durationMs: track.durationMs || 0,
     playCount: track.playCount || 0,
   }),
+}));
+
+vi.mock("@/shared/api/auth-session", () => ({
+  getAuthSessionBoundaryGeneration: () => mocks.boundary,
 }));
 
 describe("useLikedTracks", () => {
@@ -32,6 +41,11 @@ describe("useLikedTracks", () => {
     document.body.appendChild(container);
     root = createRoot(container);
     vi.clearAllMocks();
+    mocks.boundary = 1;
+    mocks.session = null;
+    mocks.boundary++;
+    window.dispatchEvent(new Event("auth:changed"));
+    mocks.session = { accessToken: "test-token", user: { id: "u1" } };
   });
 
   afterEach(() => {
@@ -105,5 +119,66 @@ describe("useLikedTracks", () => {
 
     expect(hookResult?.isLoading).toBe(false);
     expect(hookResult?.data.tracks).toHaveLength(2);
+  });
+
+  it("does not expose or cache account A likes after switching to account B", async () => {
+    let resolveA!: (value: any) => void;
+    (api.listLikedTracks as any).mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve; }));
+    let hookResult: ReturnType<typeof useLikedTracks> | undefined;
+    function TestComponent() { hookResult = useLikedTracks(); return null; }
+    await act(async () => { root.render(<TestComponent />); });
+
+    mocks.session = { accessToken: "token-b", user: { id: "u2" } };
+    (api.listLikedTracks as any).mockResolvedValueOnce({ items: [{ track: { id: "b-track" } }], nextCursor: null });
+    await act(async () => {
+      window.dispatchEvent(new Event("auth:changed"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(hookResult?.data.tracks.map((track) => track.id)).toEqual(["b-track"]);
+
+    await act(async () => {
+      resolveA({ items: [{ track: { id: "a-private" } }], nextCursor: null });
+      await Promise.resolve();
+    });
+    expect(hookResult?.data.tracks.map((track) => track.id)).toEqual(["b-track"]);
+  });
+
+  it("does not let an earlier same-track rollback undo a newer optimistic action", async () => {
+    let hookResult: ReturnType<typeof useLikedTracks> | undefined;
+    function TestComponent() { hookResult = useLikedTracks(); return null; }
+    (api.listLikedTracks as any).mockResolvedValue({ items: [], nextCursor: null });
+    await act(async () => { root.render(<TestComponent />); });
+    let rollbackUnlike = () => {};
+    let rollbackLike = () => {};
+    act(() => {
+      rollbackUnlike = applyOptimisticUnlike("same-track");
+      rollbackLike = applyOptimisticLike("same-track");
+    });
+    expect(hookResult?.data.tracks.map((track) => track.id)).toContain("same-track");
+
+    act(() => rollbackUnlike());
+    expect(hookResult?.data.tracks.map((track) => track.id)).toContain("same-track");
+    act(() => rollbackLike());
+  });
+
+  it("does not let account A's failed optimistic mutation remove account B's override", async () => {
+    let hookResult: ReturnType<typeof useLikedTracks> | undefined;
+    function TestComponent() { hookResult = useLikedTracks(); return null; }
+    (api.listLikedTracks as any).mockResolvedValue({ items: [], nextCursor: null });
+    await act(async () => { root.render(<TestComponent />); });
+    let rollbackA = () => {};
+    act(() => { rollbackA = applyOptimisticLike("same-track"); });
+
+    mocks.session = { accessToken: "token-b", user: { id: "u2" } };
+    mocks.boundary++;
+    await act(async () => {
+      window.dispatchEvent(new Event("auth:changed"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { applyOptimisticLike("same-track"); });
+    act(() => rollbackA());
+    expect(hookResult?.data.tracks.map((track) => track.id)).toContain("same-track");
   });
 });

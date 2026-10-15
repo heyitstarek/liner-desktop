@@ -3,6 +3,7 @@ import { api, ApiError } from "@/shared/api";
 import {
   clearAuthSession,
   getAuthSession,
+  getAuthSessionIdentity,
   setAuthSession,
   refreshAuthSession,
   type AuthUser,
@@ -27,17 +28,33 @@ export type AuthState = {
   logout: () => Promise<void>;
 };
 
+let authOperationGeneration = 0;
+
+function isCurrentSessionOperation(
+  generation: number,
+  identity: string,
+): boolean {
+  return (
+    generation === authOperationGeneration &&
+    getAuthSessionIdentity() === identity
+  );
+}
+
 export const useAuthStore = create<AuthState>((set) => ({
   status: "initializing",
   user: null,
   initialize: async () => {
+    const generation = ++authOperationGeneration;
     const stored = getAuthSession();
     if (!stored) {
-      set({ status: "anonymous", user: null });
+      if (generation === authOperationGeneration) {
+        set({ status: "anonymous", user: null });
+      }
       return;
     }
+    const identity = getAuthSessionIdentity();
     // Optimistically authenticate if stored user is present
-    if (stored.user) {
+    if (stored.user && isCurrentSessionOperation(generation, identity)) {
       set({ status: "authenticated", user: stored.user });
     }
     try {
@@ -46,18 +63,22 @@ export const useAuthStore = create<AuthState>((set) => ({
         setTimeout(() => reject(new Error("Auth initialize timeout")), 6000),
       );
       const user = await Promise.race([getMePromise, timeoutPromise]);
+      if (!isCurrentSessionOperation(generation, identity)) return;
       const current = getAuthSession();
       if (current) setAuthSession({ ...current, user: user ?? current.user });
       set({ status: "authenticated", user: user ?? current?.user ?? stored.user });
     } catch (err) {
+      if (!isCurrentSessionOperation(generation, identity)) return;
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         // Attempt refresh before clearing session in case access token expired between sessions
         const current = getAuthSession();
         if (current?.refreshToken) {
           try {
             const refreshed = await refreshAuthSession();
+            if (!isCurrentSessionOperation(generation, identity)) return;
             if (refreshed) {
               const retryUser = await api.getMe().catch(() => null);
+              if (!isCurrentSessionOperation(generation, identity)) return;
               const active = getAuthSession();
               if (active) setAuthSession({ ...active, user: retryUser ?? active.user });
               set({
@@ -84,21 +105,31 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
   },
   login: async (email, password) => {
+    const generation = ++authOperationGeneration;
     const result = await api.login(email, password);
+    if (generation !== authOperationGeneration) return;
     set({ status: "authenticated", user: result.user });
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("library:changed"));
     }
   },
   register: async (email, password, username, displayName) => {
+    const generation = ++authOperationGeneration;
     const result = await api.register(email, password, username, displayName);
+    if (generation !== authOperationGeneration) return;
     set({ status: "authenticated", user: result.user });
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("library:changed"));
     }
   },
   updateProfile: async (patch) => {
+    const generation = authOperationGeneration;
+    const before = getAuthSession();
+    const identity = getAuthSessionIdentity();
     const updated = await api.updateProfile(patch);
+    if (!before || !isCurrentSessionOperation(generation, identity)) {
+      return updated;
+    }
     const current = getAuthSession();
     if (current) {
       setAuthSession({ ...current, user: { ...current.user, ...updated } });
@@ -109,6 +140,9 @@ export const useAuthStore = create<AuthState>((set) => ({
     return updated;
   },
   logout: async () => {
+    const generation = ++authOperationGeneration;
+    set({ status: "anonymous", user: null });
+    const clearSession = clearAuthSession().catch(() => undefined);
     try {
       usePlayerStore.getState().dispatch({ type: "PAUSE_REQUESTED" });
       playerRuntime?.pause();
@@ -123,9 +157,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     if (typeof window !== "undefined" && window.location.hash.includes("/player")) {
       window.location.hash = "#/";
     }
-    await clearAuthSession();
-    set({ status: "anonymous", user: null });
-    if (typeof window !== "undefined") {
+    await clearSession;
+    if (generation === authOperationGeneration && typeof window !== "undefined") {
       window.dispatchEvent(new Event("library:changed"));
     }
   },

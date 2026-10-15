@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, toClientTrack, mediaUrl } from "@/shared/api";
+import { api, getAuthSessionIdentity, toClientTrack, mediaUrl } from "@/shared/api";
 import { queryCache } from "@/shared/cache/queryCache";
 import type { Track } from "@/shared/types";
 import type { CollectionPageData } from "@/features/collection/hooks/useCollection";
@@ -59,18 +59,42 @@ export function getDailyMixArtists(
   return result;
 }
 
-const cache = { data: [] as DailyMix[], timestamp: 0 };
+const cache = new Map<string, { data: DailyMix[]; timestamp: number }>();
 const CACHE_TTL = 120_000;
 
+export function getDailyMixesCollectionCacheKey(identity: string, id: string): string {
+  return `collection:playlist:daily-mixes:${identity}:${id}`;
+}
+
 export function useDailyMixes() {
+  const [authRevision, setAuthRevision] = useState(0);
+  const identity = getAuthSessionIdentity();
+  const cached = cache.get(identity);
   const [data, setData] = useState<DailyMix[]>(() => {
-    return cache.data.length > 0 ? cache.data : [];
+    return cached?.data ?? [];
   });
-  const [isLoading, setIsLoading] = useState(() => cache.data.length === 0);
+  const [isLoading, setIsLoading] = useState(() => !cached || cached.data.length === 0);
 
   useEffect(() => {
-    if (cache.data.length > 0 && Date.now() - cache.timestamp < CACHE_TTL) {
-      setData(cache.data);
+    const onAuthChanged = () => {
+      setData([]);
+      setIsLoading(true);
+      setAuthRevision((revision) => revision + 1);
+    };
+    window.addEventListener("auth:changed", onAuthChanged);
+    return () => window.removeEventListener("auth:changed", onAuthChanged);
+  }, []);
+
+  useEffect(() => {
+    const requestIdentity = getAuthSessionIdentity();
+    if (requestIdentity === "anonymous") {
+      setData([]);
+      setIsLoading(false);
+      return;
+    }
+    const current = cache.get(requestIdentity);
+    if (current && current.data.length > 0 && Date.now() - current.timestamp < CACHE_TTL) {
+      setData(current.data);
       setIsLoading(false);
       return;
     }
@@ -79,7 +103,7 @@ export function useDailyMixes() {
     api
       .getDailyMixes()
       .then((res) => {
-        if (!active) return;
+        if (!active || requestIdentity !== getAuthSessionIdentity()) return;
         const mixes: DailyMix[] = (res.items || []).map((mix) => {
           const clientTracks = (mix.tracks || []).map((t) => toClientTrack(t));
           const primaryCover =
@@ -108,26 +132,25 @@ export function useDailyMixes() {
             coverUrl: primaryCover || "",
             tracks: clientTracks,
           };
-          queryCache.set(`collection:playlist:${mix.id}`, collectionData);
+          queryCache.set(getDailyMixesCollectionCacheKey(requestIdentity, mix.id), collectionData);
 
           return mixItem;
         });
 
-        cache.data = mixes;
-        cache.timestamp = Date.now();
+        cache.set(requestIdentity, { data: mixes, timestamp: Date.now() });
         setData(mixes);
       })
       .catch(() => {
-        if (active) setData([]);
+        if (active && requestIdentity === getAuthSessionIdentity()) setData([]);
       })
       .finally(() => {
-        if (active) setIsLoading(false);
+        if (active && requestIdentity === getAuthSessionIdentity()) setIsLoading(false);
       });
 
     return () => {
       active = false;
     };
-  }, []);
+  }, [identity, authRevision]);
 
   return { data, isLoading };
 }

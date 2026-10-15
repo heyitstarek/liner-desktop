@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
-import { api, mediaUrl, toClientTrack } from "@/shared/api";
+import { api, getAuthSessionIdentity, mediaUrl, toClientTrack } from "@/shared/api";
 import { queryCache } from "@/shared/cache/queryCache";
 import type { Track } from "@/shared/types";
-import { getDailyMixArtists } from "@/features/home/hooks/useDailyMixes";
+import {
+  getDailyMixArtists,
+  getDailyMixesCollectionCacheKey,
+} from "@/features/home/hooks/useDailyMixes";
 
 export interface CollectionPageData {
   type?: "playlist" | "album";
@@ -16,14 +19,46 @@ export interface CollectionPageData {
   isDailyMix?: boolean;
 }
 
+function decodeId(id: string): string {
+  try { return decodeURIComponent(id); } catch { return id; }
+}
+
 export function useCollection(type: string | null, id: string | null) {
-  const cacheKey = type && id ? `collection:${type}:${id}` : null;
+  const [authRevision, setAuthRevision] = useState(0);
+  const decodedMixId = id ? decodeId(id) : "";
+  const dailyMixId = id && type === "playlist" && (
+    id.startsWith("daily-mix") || id.startsWith("mix-") ||
+    decodedMixId.startsWith("daily-mix") || decodedMixId.startsWith("mix-")
+  );
+  const identity = getAuthSessionIdentity();
+  const cacheKey = type && id
+    ? dailyMixId
+      ? getDailyMixesCollectionCacheKey(identity, decodedMixId)
+      : `collection:${type}:${id}`
+    : null;
   const cached = cacheKey ? queryCache.get<CollectionPageData>(cacheKey) : undefined;
   const [data, setData] = useState<CollectionPageData | null>(cached ?? null);
   const [loading, setLoading] = useState<boolean>(!cached && Boolean(type && id));
 
   useEffect(() => {
+    const onAuthChanged = () => {
+      if (!dailyMixId) return;
+      setData(null);
+      setLoading(true);
+      setAuthRevision((revision) => revision + 1);
+    };
+    window.addEventListener("auth:changed", onAuthChanged);
+    return () => window.removeEventListener("auth:changed", onAuthChanged);
+  }, [dailyMixId]);
+
+  useEffect(() => {
     if (!type || !id || !cacheKey) {
+      setData(null);
+      setLoading(false);
+      return;
+    }
+
+    if (dailyMixId && identity === "anonymous") {
       setData(null);
       setLoading(false);
       return;
@@ -157,7 +192,7 @@ export function useCollection(type: string | null, id: string | null) {
       active = false;
       unsubscribe();
     };
-  }, [type, id, cacheKey]);
+  }, [type, id, cacheKey, authRevision]);
 
   return { data, loading };
 }

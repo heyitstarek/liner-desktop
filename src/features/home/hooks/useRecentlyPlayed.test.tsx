@@ -5,10 +5,16 @@ import { act } from "react";
 import { useRecentlyPlayed } from "./useRecentlyPlayed";
 import { api } from "@/shared/api";
 
+const mocks = vi.hoisted(() => ({ session: { accessToken: "token-a", user: { id: "a" } } as any }));
+
 vi.mock("@/shared/api", () => ({
   api: {
     getHistory: vi.fn(),
   },
+  getAuthSession: () => mocks.session,
+  getAuthSessionIdentity: () => mocks.session?.accessToken
+    ? mocks.session.user?.id ? `user:${mocks.session.user.id}` : `token:${mocks.session.accessToken}`
+    : "anonymous",
   toClientTrack: (track: any) => ({
     id: track.id,
     title: track.title,
@@ -132,5 +138,30 @@ describe("useRecentlyPlayed", () => {
       }),
       playCount: 1,
     });
+  });
+
+  it("does not show or cache account A history after an auth change to account B", async () => {
+    let resolveA!: (value: any) => void;
+    (api.getHistory as any).mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve; }));
+    let hookResult: ReturnType<typeof useRecentlyPlayed> | undefined;
+    function TestComponent() { hookResult = useRecentlyPlayed(19); return null; }
+    await act(async () => { root.render(<TestComponent />); });
+
+    mocks.session = { accessToken: "token-b", user: { id: "b" } };
+    (api.getHistory as any).mockResolvedValueOnce({ items: [{ track: { id: "b-history" } }] });
+    await act(async () => { window.dispatchEvent(new Event("auth:changed")); await Promise.resolve(); await Promise.resolve(); });
+    expect(hookResult?.data.map((item) => item.item.id)).toEqual(["b-history"]);
+
+    await act(async () => { resolveA({ items: [{ track: { id: "a-history" } }] }); await Promise.resolve(); });
+    expect(hookResult?.data.map((item) => item.item.id)).toEqual(["b-history"]);
+  });
+
+  it("does not request private history without an authenticated session", async () => {
+    mocks.session = null;
+    let hookResult: ReturnType<typeof useRecentlyPlayed> | undefined;
+    function TestComponent() { hookResult = useRecentlyPlayed(18); return null; }
+    await act(async () => { root.render(<TestComponent />); });
+    expect(api.getHistory).not.toHaveBeenCalled();
+    expect(hookResult).toMatchObject({ data: [], isLoading: false });
   });
 });
