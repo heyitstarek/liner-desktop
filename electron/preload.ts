@@ -77,6 +77,9 @@ export interface LinerElectronApi {
   }>;
   setAppIcon: (dataUrl: string) => Promise<void>;
   getAppVersion: () => Promise<string>;
+  loadAuthSession: () => Promise<unknown | null>;
+  saveAuthSession: (session: unknown) => Promise<boolean>;
+  clearAuthSession: () => Promise<boolean>;
   getCacheStats: () => Promise<ElectronCacheStats>;
   openCacheFolder: () => Promise<boolean>;
   clearCoversCache: () => Promise<boolean>;
@@ -168,6 +171,9 @@ const api: LinerElectronApi = {
   saveDump: (input) => ipcRenderer.invoke("dialog:save-dump", input),
   setAppIcon: (dataUrl) => ipcRenderer.invoke("app:set-icon", dataUrl),
   getAppVersion: () => ipcRenderer.invoke("app:get-version"),
+  loadAuthSession: () => ipcRenderer.invoke("auth-session:load"),
+  saveAuthSession: (session) => ipcRenderer.invoke("auth-session:save", session),
+  clearAuthSession: () => ipcRenderer.invoke("auth-session:clear"),
   getCacheStats: () => ipcRenderer.invoke("storage:get-cache-stats"),
   openCacheFolder: () => ipcRenderer.invoke("shell:open-cache-folder"),
   clearCoversCache: () => ipcRenderer.invoke("storage:clear-covers-cache"),

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, screen, dialog, session, nativeImage, powerSaveBlocker } from "electron";
+import { app, BrowserWindow, ipcMain, shell, screen, dialog, session, nativeImage, powerSaveBlocker, safeStorage } from "electron";
 import { autoUpdater } from "electron-updater";
 import path from "node:path";
 import fs from "node:fs";
@@ -7,7 +7,7 @@ import net from "node:net";
 import tls from "node:tls";
 import https from "node:https";
 import { execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   signCoverUrl,
   signRequest,
@@ -34,6 +34,12 @@ import { TouchBarManager } from "./touchbar.js";
 import { OverlayManager } from "./overlay.js";
 import { BundleManager } from "./bundle-manager.js";
 import { createSleepBlocker } from "./sleep-blocker.js";
+import { createGuardedIpc, RendererSecurity } from "./renderer-security.js";
+import { openFolderOrReveal } from "./shell-path.js";
+import { createAuthSessionStorage } from "./auth-storage.js";
+
+// Exported for the isolated Electron compatibility smoke; never exposed to renderers.
+export { RendererSecurity };
 
 // root error handling for main process
 process.on("uncaughtException", (error) => {
@@ -67,6 +73,49 @@ let mainWindow: BrowserWindow | null = null;
 let touchBarManager: TouchBarManager | null = null;
 let overlayManager: OverlayManager | null = null;
 let bundleManager: BundleManager | null = null;
+
+const configuredCorsOrigins = [
+  import.meta.env.VITE_API_URL as string | undefined,
+  import.meta.env.VITE_COVERS_PROXY_URL as string | undefined,
+].flatMap((raw) => {
+  if (!raw) return [];
+  try {
+    const url = new URL(raw);
+    const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    const allowedScheme = url.protocol === "https:" || (import.meta.env.DEV && isLoopback && url.protocol === "http:");
+    if (!allowedScheme || url.username || url.password || url.search || url.hash) return [];
+    return [url.origin];
+  } catch {
+    return [];
+  }
+});
+
+const rendererSecurity = new RendererSecurity({
+  builtInIndexPath: path.join(RENDERER_DIST, "index.html"),
+  activeBundleIndexPath: () => bundleManager?.getEffectiveIndexPath() ?? null,
+  devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  corsOrigins: configuredCorsOrigins,
+  allowConfiguredLoopbackHttp: Boolean(import.meta.env.DEV),
+  windows: {
+    main: () => mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    overlay: () => overlayManager?.getWebContents() ?? null,
+  },
+});
+const mainIpc = createGuardedIpc(
+  ipcMain,
+  "main",
+  (event, role) => rendererSecurity.isTrustedIpcSender(event, role),
+);
+const overlayIpc = createGuardedIpc(
+  ipcMain,
+  "overlay",
+  (event, role) => rendererSecurity.isTrustedIpcSender(event, role),
+);
+const eitherWindowIpc = createGuardedIpc(
+  ipcMain,
+  "either",
+  (event, role) => rendererSecurity.isTrustedIpcSender(event, role),
+);
 
 // liner:// deeplink support (share links bounce here from link.tryliner.fun)
 
@@ -116,7 +165,7 @@ function createWindow() {
       sandbox: true,
       devTools: true,
       backgroundThrottling: false, // keeps audio timer and playback ticks running when app is in background or another workspace
-      webSecurity: false,
+      webSecurity: true,
     },
   });
 
@@ -134,12 +183,7 @@ function createWindow() {
   mainWindow.on("enter-full-screen", broadcastWindowState);
   mainWindow.on("leave-full-screen", broadcastWindowState);
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("https:") || url.startsWith("http:")) {
-      shell.openExternal(url);
-    }
-    return { action: "deny" };
-  });
+  rendererSecurity.installNavigationGuards(mainWindow.webContents, (url) => shell.openExternal(url));
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     console.error(
@@ -182,13 +226,17 @@ function createWindow() {
   });
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    const rendererUrl = process.env.VITE_DEV_SERVER_URL;
+    rendererSecurity.authorizeLoadedDocument(mainWindow.webContents, rendererUrl);
+    mainWindow.loadURL(rendererUrl);
   } else {
     bundleManager = new BundleManager({
       defaultRendererDist: RENDERER_DIST,
     });
     bundleManager.setMainWindow(mainWindow);
-    mainWindow.loadFile(bundleManager.getEffectiveIndexPath());
+    const indexPath = bundleManager.getEffectiveIndexPath();
+    rendererSecurity.authorizeLoadedDocument(mainWindow.webContents, pathToFileURL(indexPath).href);
+    mainWindow.loadFile(indexPath);
   }
 
   // renderer ready, deliver any cold-start deeplink waiting in the queue
@@ -232,6 +280,11 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(() => {
+    const authSessionStorage = createAuthSessionStorage({
+      userDataPath: app.getPath("userData"),
+      platform: process.platform,
+      safeStorage,
+    });
     // register liner:// so browsers / xdg-open route share links to us
     // (on linux the packaged .desktop carries the mime handler too)
     if (process.defaultApp && process.argv.length >= 2) {
@@ -239,20 +292,27 @@ if (!gotTheLock) {
     } else {
       app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
     }
+    rendererSecurity.installCrossOriginCompatibility(session.defaultSession);
     touchBarManager = new TouchBarManager(
       path.join(__dirname, "preload.cjs"),
       RENDERER_DIST,
+      mainIpc,
     );
     touchBarManager.registerShortcut();
 
     const updateSleepBlocker = createSleepBlocker(powerSaveBlocker);
-    ipcMain.on("touchbar:update-state", (_event, state: { status: string }) => {
+    mainIpc.on("touchbar:update-state", (_event, state: { status: string }) => {
       updateSleepBlocker(state.status);
     });
 
     overlayManager = new OverlayManager(
       path.join(__dirname, "preload.cjs"),
       RENDERER_DIST,
+      rendererSecurity,
+      mainIpc,
+      overlayIpc,
+      eitherWindowIpc,
+      () => bundleManager?.getEffectiveIndexPath() ?? path.join(RENDERER_DIST, "index.html"),
     );
     overlayManager.setMainWindow(mainWindow);
     overlayManager.registerShortcut();
@@ -264,13 +324,13 @@ if (!gotTheLock) {
     );
 
     // window controls
-    ipcMain.handle("window:minimize", () => {
+    mainIpc.handle("window:minimize", () => {
       // cannot minimize a native fullscreen window or under hyprland tiling wm
       if (!mainWindow || mainWindow.isFullScreen() || isHyprland) return;
       mainWindow.minimize();
     });
 
-    ipcMain.handle("window:toggle-maximize", () => {
+    mainIpc.handle("window:toggle-maximize", () => {
       if (!mainWindow) return;
       // on macos, frameless windows enter native fullscreen mode
       if (process.platform === "darwin") {
@@ -286,28 +346,32 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("window:toggle-fullscreen", () => {
+    mainIpc.handle("window:toggle-fullscreen", () => {
       if (!mainWindow) return;
       mainWindow.setFullScreen(!mainWindow.isFullScreen());
     });
 
-    ipcMain.handle("window:close", () => {
+    mainIpc.handle("window:close", () => {
       mainWindow?.close();
     });
 
-    ipcMain.handle("window:is-maximized", () => {
+    mainIpc.handle("window:is-maximized", () => {
       return mainWindow?.isMaximized() ?? false;
     });
 
-    ipcMain.handle("window:is-fullscreen", () => {
+    mainIpc.handle("window:is-fullscreen", () => {
       return mainWindow?.isFullScreen() ?? false;
     });
 
-    ipcMain.handle("app:get-version", () => {
+    mainIpc.handle("app:get-version", () => {
       return app.getVersion();
     });
 
-    ipcMain.handle("app:set-icon", async (_event, dataUrl: string) => {
+    mainIpc.handle("auth-session:load", () => authSessionStorage.load());
+    mainIpc.handle("auth-session:save", (_event, value: unknown) => authSessionStorage.save(value));
+    mainIpc.handle("auth-session:clear", () => authSessionStorage.clear());
+
+    mainIpc.handle("app:set-icon", async (_event, dataUrl: string) => {
       if (!mainWindow || !dataUrl) return;
       try {
         const icon = nativeImage.createFromDataURL(dataUrl);
@@ -322,14 +386,6 @@ if (!gotTheLock) {
       }
     });
 
-    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-      const responseHeaders = { ...(details.responseHeaders || {}) };
-      responseHeaders["access-control-allow-origin"] = ["*"];
-      responseHeaders["access-control-allow-headers"] = ["*"];
-      responseHeaders["access-control-allow-methods"] = ["GET, HEAD, OPTIONS"];
-      callback({ responseHeaders });
-    });
-
     let lastSavedExportPath: string | null = null;
 
     session.defaultSession.on("will-download", (_event, item) => {
@@ -340,7 +396,7 @@ if (!gotTheLock) {
       });
     });
 
-    ipcMain.handle("dialog:save-dump", async (_event, { filename, content }: { filename: string; content: string }) => {
+    mainIpc.handle("dialog:save-dump", async (_event, { filename, content }: { filename: string; content: string }) => {
       if (!mainWindow) return { success: false, canceled: true };
       try {
         const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
@@ -359,35 +415,19 @@ if (!gotTheLock) {
       }
     });
 
-    const openFolderOrItem = async (customPath?: string) => {
-      try {
-        const targetPath = customPath || lastSavedExportPath;
-        if (targetPath && fs.existsSync(targetPath)) {
-          // opens explorer/finder highlighting the exported file
-          shell.showItemInFolder(targetPath);
-          return true;
-        }
-        if (targetPath) {
-          const dir = path.dirname(targetPath);
-          if (fs.existsSync(dir)) {
-            await shell.openPath(dir);
-            return true;
-          }
-        }
-        const downloadsPath = app.getPath("downloads");
-        await shell.openPath(downloadsPath);
-        return true;
-      } catch (err) {
-        console.error("\x1b[41;37m shell \x1b[0m open-export-folder error:", err);
-        return false;
-      }
-    };
+    const openFolderOrItem = (customPath?: string) => openFolderOrReveal(
+      customPath,
+      lastSavedExportPath,
+      app.getPath("downloads"),
+      fs,
+      shell,
+    );
 
-    ipcMain.handle("shell:open-downloads", async (_event, customPath?: string) => {
+    mainIpc.handle("shell:open-downloads", async (_event, customPath?: string) => {
       return openFolderOrItem(customPath);
     });
 
-    ipcMain.handle("shell:open-export-folder", async (_event, customPath?: string) => {
+    mainIpc.handle("shell:open-export-folder", async (_event, customPath?: string) => {
       return openFolderOrItem(customPath);
     });
 
@@ -448,7 +488,7 @@ if (!gotTheLock) {
       } catch {}
     };
 
-    ipcMain.handle("storage:get-cache-stats", async () => {
+    mainIpc.handle("storage:get-cache-stats", async () => {
       try {
         const userData = app.getPath("userData");
         const cachePath = getCacheDirectory();
@@ -490,9 +530,11 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("shell:open-cache-folder", async () => {
+    mainIpc.handle("shell:open-cache-folder", async () => {
       try {
         const cachePath = getCacheDirectory();
+        const cacheStat = await fs.promises.stat(cachePath).catch(() => null);
+        if (!cacheStat?.isDirectory()) return false;
         await shell.openPath(cachePath);
         return true;
       } catch (err) {
@@ -501,7 +543,7 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("storage:clear-covers-cache", async () => {
+    mainIpc.handle("storage:clear-covers-cache", async () => {
       try {
         await session.defaultSession.clearStorageData({
           storages: ["serviceworkers", "cachestorage"],
@@ -515,7 +557,7 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("storage:clear-audio-cache", async (_event, clearEntireDb?: boolean) => {
+    mainIpc.handle("storage:clear-audio-cache", async (_event, clearEntireDb?: boolean) => {
       try {
         const userData = app.getPath("userData");
         if (clearEntireDb) {
@@ -534,7 +576,7 @@ if (!gotTheLock) {
     });
 
     // clears chromium http and v8 code cache
-    ipcMain.handle("storage:clear-http-cache", async () => {
+    mainIpc.handle("storage:clear-http-cache", async () => {
       try {
         await session.defaultSession.clearCache();
         await session.defaultSession.clearCodeCaches({});
@@ -552,7 +594,7 @@ if (!gotTheLock) {
     let dragStartCursor: { x: number; y: number } | null = null;
     let dragStartWinPos: { x: number; y: number } | null = null;
 
-    ipcMain.on("window:start-drag", () => {
+    mainIpc.on("window:start-drag", () => {
       if (!mainWindow || mainWindow.isFullScreen()) return;
       try {
         if (typeof (mainWindow as any).startWindowMove === "function") {
@@ -569,7 +611,7 @@ if (!gotTheLock) {
       dragStartWinPos = { x: wx, y: wy };
     });
 
-    ipcMain.on("window:drag-start", () => {
+    mainIpc.on("window:drag-start", () => {
       if (!mainWindow || mainWindow.isFullScreen()) return;
       if (mainWindow.isMaximized()) {
         mainWindow.unmaximize();
@@ -579,12 +621,12 @@ if (!gotTheLock) {
       dragStartWinPos = { x: wx, y: wy };
     });
 
-    ipcMain.on("window:drag-end", () => {
+    mainIpc.on("window:drag-end", () => {
       dragStartCursor = null;
       dragStartWinPos = null;
     });
 
-    ipcMain.on("window:drag-move", (_event, { deltaX, deltaY }: { deltaX: number; deltaY: number }) => {
+    mainIpc.on("window:drag-move", (_event, { deltaX, deltaY }: { deltaX: number; deltaY: number }) => {
       if (!mainWindow || mainWindow.isFullScreen()) return;
       if (mainWindow.isMaximized()) {
         mainWindow.unmaximize();
@@ -612,7 +654,7 @@ if (!gotTheLock) {
     });
 
     // signing ipc handlers
-    ipcMain.handle("signer:sign-cover-url", (_event, payload: string) => {
+    mainIpc.handle("signer:sign-cover-url", (_event, payload: string) => {
       try {
         return signCoverUrl(payload);
       } catch (err: any) {
@@ -621,7 +663,7 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle(
+    mainIpc.handle(
       "signer:sign-request",
       (_event, request: SignRequestInput) => {
         try {
@@ -633,7 +675,7 @@ if (!gotTheLock) {
       },
     );
 
-    ipcMain.handle(
+    mainIpc.handle(
       "signer:sign-monitor-request",
       (_event, request: SignRequestInput) => {
         try {
@@ -645,7 +687,7 @@ if (!gotTheLock) {
       },
     );
 
-    ipcMain.handle(
+    mainIpc.handle(
       "signer:sign-raw-payload",
       (_event, payload: number[] | Uint8Array) => {
         try {
@@ -658,7 +700,7 @@ if (!gotTheLock) {
       },
     );
 
-    ipcMain.handle(
+    mainIpc.handle(
       "signer:sync-time",
       (_event, dateHeaderOrMs: string | number) => {
         try {
@@ -670,7 +712,7 @@ if (!gotTheLock) {
       },
     );
 
-    ipcMain.handle("signer:get-time-offset", () => {
+    mainIpc.handle("signer:get-time-offset", () => {
       return getServerTimeOffset();
     });
 
@@ -678,7 +720,7 @@ if (!gotTheLock) {
 
     // offline-dump diagnostics: real dns + tcp from the user machine.
     // hosts come from the renderer but are re-validated here.
-    ipcMain.handle("net:diagnose", async (_event, hosts: unknown): Promise<MainNetResult> => {
+    mainIpc.handle("net:diagnose", async (_event, hosts: unknown): Promise<MainNetResult> => {
       const list = (
         Array.isArray(hosts)
           ? hosts.filter(
@@ -929,7 +971,7 @@ if (!gotTheLock) {
       });
     });
 
-    ipcMain.handle("updater:check-for-updates", async () => {
+    mainIpc.handle("updater:check-for-updates", async () => {
       if (!app.isPackaged) {
         return { available: false, error: "Updater is disabled in dev mode" };
       }
@@ -945,7 +987,7 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("updater:download-update", async () => {
+    mainIpc.handle("updater:download-update", async () => {
       if (!app.isPackaged) {
         return { success: false, error: "Updater is disabled in dev mode" };
       }
@@ -957,7 +999,7 @@ if (!gotTheLock) {
       }
     });
 
-    ipcMain.handle("updater:quit-and-install", () => {
+    mainIpc.handle("updater:quit-and-install", () => {
       setImmediate(() => {
         autoUpdater.quitAndInstall(false, true);
       });
@@ -965,31 +1007,31 @@ if (!gotTheLock) {
     });
 
     // OTA bundle updater IPC handlers
-    ipcMain.handle("bundle:check", async () => {
+    mainIpc.handle("bundle:check", async () => {
       if (!bundleManager) {
         return { available: false, error: "Bundle updater inactive (dev mode)" };
       }
       return await bundleManager.checkForUpdates();
     });
 
-    ipcMain.handle("bundle:download-and-install", async (_event, manifest) => {
+    mainIpc.handle("bundle:download-and-install", async (_event, manifest) => {
       if (!bundleManager) {
         return { success: false, error: "Bundle updater inactive (dev mode)" };
       }
       return await bundleManager.downloadAndInstall(manifest);
     });
 
-    ipcMain.handle("bundle:hot-swap", () => {
+    mainIpc.handle("bundle:hot-swap", () => {
       if (!bundleManager) return false;
       return bundleManager.hotSwap();
     });
 
-    ipcMain.handle("bundle:rollback", () => {
+    mainIpc.handle("bundle:rollback", () => {
       if (!bundleManager) return false;
       return bundleManager.rollback();
     });
 
-    ipcMain.handle("bundle:get-status", () => {
+    mainIpc.handle("bundle:get-status", () => {
       const activeState = bundleManager?.getActiveState?.() || null;
       return {
         appVersion: app.getVersion(),

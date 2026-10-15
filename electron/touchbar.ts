@@ -1,4 +1,5 @@
-import { BrowserWindow, ipcMain, TouchBar } from "electron";
+import { BrowserWindow, TouchBar } from "electron";
+import type { GuardedIpc } from "./renderer-security.js";
 
 export interface TouchBarTrackInfo {
   id?: string;
@@ -63,7 +64,7 @@ export class TouchBarManager {
   private nativeTrackLabel: any = null;
   private nativeLyricsLabel: any = null;
 
-  constructor(_preloadPath?: string, _rendererDist?: string) {
+  constructor(_preloadPath?: string, _rendererDist?: string, private readonly mainIpc?: GuardedIpc) {
     this.registerIpcHandlers();
   }
 
@@ -125,7 +126,9 @@ export class TouchBarManager {
   }
 
   private registerIpcHandlers() {
-    ipcMain.on("touchbar:update-state", (_event, state: TouchBarStatePayload) => {
+    const ipc = this.mainIpc;
+    if (!ipc) return;
+    ipc.on("touchbar:update-state", (_event, state: TouchBarStatePayload) => {
       this.latestState = state;
 
       if (process.platform === "darwin" && this.nativeTouchBar) {
@@ -143,7 +146,7 @@ export class TouchBarManager {
       }
     });
 
-    ipcMain.on("touchbar:send-action", (_event, action: TouchBarAction) => {
+    ipc.on("touchbar:send-action", (_event, action: TouchBarAction) => {
       if (action.type === "restoreMainWindow") {
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           if (this.mainWindow.isMinimized()) {
@@ -157,20 +160,20 @@ export class TouchBarManager {
       this.forwardAction(action);
     });
 
-    ipcMain.handle("touchbar:get-initial-state", () => {
+    ipc.handle("touchbar:get-initial-state", () => {
       return this.latestState;
     });
 
-    ipcMain.handle("touchbar:toggle-simulator", () => {
+    ipc.handle("touchbar:toggle-simulator", () => {
       return false;
     });
 
-    ipcMain.handle("touchbar:is-simulator-open", () => {
+    ipc.handle("touchbar:is-simulator-open", () => {
       return false;
     });
 
-    ipcMain.on("touchbar:close-simulator", () => {});
-    ipcMain.on("touchbar:update-settings", () => {});
+    ipc.on("touchbar:close-simulator", () => {});
+    ipc.on("touchbar:update-settings", () => {});
   }
 
   public registerShortcut() {

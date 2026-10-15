@@ -1,6 +1,8 @@
-import { BrowserWindow, ipcMain, screen, globalShortcut, app } from "electron";
+import { BrowserWindow, screen, globalShortcut, app, shell } from "electron";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import fs from "node:fs";
+import type { GuardedIpc, RendererSecurity } from "./renderer-security.js";
 
 export type OverlayPosition = "top-left" | "top-center" | "top-right";
 
@@ -51,7 +53,11 @@ export class OverlayManager {
   private overlayWindow: BrowserWindow | null = null;
   private latestState: any = null;
   private preloadPath: string;
-  private rendererDist: string;
+  private security: RendererSecurity;
+  private mainIpc: GuardedIpc;
+  private overlayIpc: GuardedIpc;
+  private eitherWindowIpc: GuardedIpc;
+  private getRendererIndexPath: () => string;
 
   private enabled = true;
   private position: OverlayPosition = "top-center";
@@ -65,9 +71,21 @@ export class OverlayManager {
   private currentAnimatedX: number | null = null;
   private closeTimeout: NodeJS.Timeout | null = null;
 
-  constructor(preloadPath: string, rendererDist: string) {
+  constructor(
+    preloadPath: string,
+    _rendererDist: string,
+    security: RendererSecurity,
+    mainIpc: GuardedIpc,
+    overlayIpc: GuardedIpc,
+    eitherWindowIpc: GuardedIpc,
+    getRendererIndexPath: () => string,
+  ) {
     this.preloadPath = preloadPath;
-    this.rendererDist = rendererDist;
+    this.security = security;
+    this.mainIpc = mainIpc;
+    this.overlayIpc = overlayIpc;
+    this.eitherWindowIpc = eitherWindowIpc;
+    this.getRendererIndexPath = getRendererIndexPath;
     this.loadPersistedSettings();
     this.registerIpcHandlers();
   }
@@ -146,6 +164,12 @@ export class OverlayManager {
         this.destroy();
       });
     }
+  }
+
+  public getWebContents() {
+    return this.overlayWindow && !this.overlayWindow.isDestroyed()
+      ? this.overlayWindow.webContents
+      : null;
   }
 
   public destroy() {
@@ -394,6 +418,7 @@ export class OverlayManager {
         sandbox: true,
         devTools: true,
         backgroundThrottling: false,
+        webSecurity: true,
       },
     });
 
@@ -414,11 +439,16 @@ export class OverlayManager {
       this.overlayWindow.setAlwaysOnTop(this.alwaysOnTop);
     }
 
-    const targetUrl = process.env.VITE_DEV_SERVER_URL
-      ? `${process.env.VITE_DEV_SERVER_URL}#/overlay`
-      : `file://${path.join(this.rendererDist, "index.html")}#/overlay`;
-
-    this.overlayWindow.loadURL(targetUrl);
+    this.security.installNavigationGuards(this.overlayWindow.webContents, (url) => shell.openExternal(url));
+    if (process.env.VITE_DEV_SERVER_URL) {
+      const rendererUrl = `${process.env.VITE_DEV_SERVER_URL}#/overlay`;
+      this.security.authorizeLoadedDocument(this.overlayWindow.webContents, rendererUrl);
+      this.overlayWindow.loadURL(rendererUrl);
+    } else {
+      const indexPath = this.getRendererIndexPath();
+      this.security.authorizeLoadedDocument(this.overlayWindow.webContents, pathToFileURL(indexPath).href);
+      this.overlayWindow.loadFile(indexPath, { hash: "/overlay" });
+    }
 
     this.overlayWindow.webContents.on("did-finish-load", () => {
       if (this.latestState && this.overlayWindow && !this.overlayWindow.isDestroyed()) {
@@ -432,7 +462,7 @@ export class OverlayManager {
   }
 
   private registerIpcHandlers() {
-    ipcMain.on("overlay:update-state", (_event, state: any) => {
+    this.mainIpc.on("overlay:update-state", (_event, state: any) => {
       this.latestState = state;
 
       if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
@@ -440,7 +470,7 @@ export class OverlayManager {
       }
     });
 
-    ipcMain.on("overlay:send-action", (_event, action: any) => {
+    this.eitherWindowIpc.on("overlay:send-action", (_event, action: any) => {
       if (action.type === "closeOverlay") {
         this.closeOverlay();
         return;
@@ -460,23 +490,23 @@ export class OverlayManager {
       }
     });
 
-    ipcMain.handle("overlay:get-initial-state", () => {
+    this.overlayIpc.handle("overlay:get-initial-state", () => {
       return this.latestState;
     });
 
-    ipcMain.handle("overlay:toggle", () => {
+    this.mainIpc.handle("overlay:toggle", () => {
       return this.toggleOverlay();
     });
 
-    ipcMain.handle("overlay:is-open", () => {
+    this.mainIpc.handle("overlay:is-open", () => {
       return Boolean(this.overlayWindow && !this.overlayWindow.isDestroyed() && this.overlayWindow.isVisible());
     });
 
-    ipcMain.on("overlay:close", () => {
+    this.eitherWindowIpc.on("overlay:close", () => {
       this.closeOverlay();
     });
 
-    ipcMain.on("overlay:update-settings", (_event, settings: Partial<OverlaySettings>) => {
+    this.mainIpc.on("overlay:update-settings", (_event, settings: Partial<OverlaySettings>) => {
       if (!settings || typeof settings !== "object") return;
 
       if (typeof settings.enabled === "boolean") {
