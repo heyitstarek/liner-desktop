@@ -40,7 +40,7 @@ function translate(key: string, vars?: Record<string, string | number>) {
   }
 }
 
-import { DEFAULT_PRIMARY_API, getApiBaseUrl, switchToFallbackEdge, switchToPrimaryApi } from "./baseUrl";
+import { DEFAULT_PRIMARY_API, getApiBaseUrl, switchToPrimaryApi } from "./baseUrl";
 
 const CLIENT_VERSION =
   (import.meta.env.VITE_CLIENT_VERSION as string | undefined) || "1.0.4-desktop";
@@ -78,6 +78,7 @@ async function fetchWithTimeout(
   try {
     const res = await fetch(url, {
       ...init,
+      redirect: "error",
       signal: controller.signal,
     });
     return res;
@@ -243,38 +244,7 @@ async function executeRequest<T>(
     if (init?.signal?.aborted || err?.name === "AbortError") {
       throw err;
     }
-    if (switchToFallbackEdge()) {
-      try {
-        const fallbackSigned = await signApiRequest(method, path, rawBody);
-        res = await fetchWithTimeout(
-          getApiBaseUrl() + path,
-          {
-            ...init,
-            headers: {
-              ...(hasBody ? { "Content-Type": "application/json" } : {}),
-              ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-              ...correlationHeaders,
-              ...fallbackSigned,
-              ...restHeaders,
-            },
-          },
-          timeoutMs,
-        );
-      } catch (fallbackErr) {
-        switchToPrimaryApi();
-        const durationMs = Math.round(performance.now() - startTime);
-        telemetry.trackNetwork(method, path, 0, durationMs, requestId);
-        if (isConnectivityFailure(fallbackErr) && !isPlaybackPath(path)) {
-          recordConnectivityFailure({
-            method,
-            path: stripQuery(path),
-            status: statusOf(fallbackErr),
-            latencyMs: durationMs,
-          });
-        }
-        throw fallbackErr;
-      }
-    } else if (getApiBaseUrl() !== DEFAULT_PRIMARY_API) {
+    if (getApiBaseUrl() !== DEFAULT_PRIMARY_API) {
       switchToPrimaryApi();
       try {
         const primarySigned = await signApiRequest(method, path, rawBody);
@@ -969,6 +939,7 @@ export const api = {
         `${getApiBaseUrl()}${path}`,
         {
           signal,
+          redirect: "error",
           headers: {
             ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
             ...correlationHeaders,
@@ -987,6 +958,7 @@ export const api = {
           `${getApiBaseUrl()}${path}`,
           {
             signal,
+            redirect: "error",
             headers: {
               ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
               ...correlationHeaders,
