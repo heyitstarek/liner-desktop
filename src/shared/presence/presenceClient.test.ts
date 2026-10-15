@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PresenceClient } from "./presenceClient";
 import * as authSession from "../api/auth-session";
+import { DEFAULT_PRIMARY_API, initApiEndpointProbe, resetEndpointProbe, setApiBaseUrl } from "../api/baseUrl";
 
 describe("PresenceClient", () => {
   let mockSockets: any[] = [];
@@ -56,7 +57,26 @@ describe("PresenceClient", () => {
 
   afterEach(() => {
     globalThis.WebSocket = originalWebSocket;
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("keeps presence credentials on WSS after a failed API health probe", async () => {
+    setApiBaseUrl(DEFAULT_PRIMARY_API);
+    resetEndpointProbe();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+    await initApiEndpointProbe();
+
+    const client = new PresenceClient();
+    try {
+      client.start();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(mockSockets).toHaveLength(1);
+      expect(mockSockets[0].url).toBe("wss://api.tryliner.fun/v1/ping/ws");
+      expect(JSON.parse(mockSockets[0].sentData[0]).token).toBe("test-valid-jwt-token");
+    } finally {
+      client.stop();
+    }
   });
 
   it("connects, sends init payload on open, and triggers periodic pings", async () => {
