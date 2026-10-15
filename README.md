@@ -119,6 +119,16 @@ bun run test
 pnpm test
 ```
 
+Run the Electron renderer sandbox smoke test against the built application:
+
+```bash
+pnpm test:electron-sandbox
+```
+
+On Linux this requires an X11 or Wayland display. The test uses an isolated
+temporary profile and local fixtures for signed API requests, audio and artwork;
+it does not sign in or contact the production service.
+
 ---
 
 ## Building
