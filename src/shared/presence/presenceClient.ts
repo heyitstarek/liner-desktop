@@ -1,4 +1,4 @@
-import { getAuthSession, getValidAccessToken } from "../api/auth-session";
+import { getAuthSession, getAuthSessionIdentity, getValidAccessToken } from "../api/auth-session";
 import { getApiBaseUrl } from "../api/baseUrl";
 import { APP_VERSION } from "../config/version";
 
@@ -31,6 +31,8 @@ export class PresenceClient {
   private isDestroyed = false;
 
   private isConnecting = false;
+  private connectionGeneration = 0;
+  private socketIdentity: string | null = null;
 
   constructor(private readonly pingIntervalMs = DEFAULT_PING_INTERVAL_MS) {}
 
@@ -39,6 +41,7 @@ export class PresenceClient {
     if (this.isRunning) return;
     this.isRunning = true;
     this.isDestroyed = false;
+    this.connectionGeneration++;
 
     if (typeof window !== "undefined") {
       window.addEventListener("auth:changed", this.handleAuthChanged);
@@ -52,6 +55,7 @@ export class PresenceClient {
   // stops presence client and tears down active socket and timers
   stop(): void {
     this.isRunning = false;
+    this.connectionGeneration++;
     this.isConnecting = false;
     this.clearTimers();
     this.disconnectSocket();
@@ -66,9 +70,15 @@ export class PresenceClient {
   private handleAuthChanged = (): void => {
     const session = getAuthSession();
     if (!session?.accessToken) {
+      this.connectionGeneration++;
+      this.isConnecting = false;
       this.disconnectSocket();
       this.clearTimers();
-    } else if (this.isRunning && (!this.ws || this.ws.readyState === WebSocket.CLOSED)) {
+    } else if (this.isRunning && getAuthSessionIdentity() !== this.socketIdentity) {
+      this.connectionGeneration++;
+      this.isConnecting = false;
+      this.disconnectSocket();
+      this.clearTimers();
       void this.connect();
     }
   };
@@ -103,6 +113,7 @@ export class PresenceClient {
     if (this.ws) {
       const socket = this.ws;
       this.ws = null;
+      this.socketIdentity = null;
       socket.onopen = null;
       socket.onclose = null;
       socket.onerror = null;
@@ -130,12 +141,25 @@ export class PresenceClient {
     }
 
     this.isConnecting = true;
+    const connectionGeneration = this.connectionGeneration;
+    const authIdentity = getAuthSessionIdentity();
 
     try {
       // verify we have an active session
       const accessToken = await getValidAccessToken();
-      if (!accessToken || !this.isRunning) {
+      if (connectionGeneration !== this.connectionGeneration || !this.isRunning) return;
+      const currentSession = getAuthSession();
+      if (
+        !accessToken ||
+        !currentSession?.accessToken ||
+        authIdentity !== getAuthSessionIdentity()
+      ) {
         this.isConnecting = false;
+        return;
+      }
+      if (currentSession.accessToken !== accessToken) {
+        this.isConnecting = false;
+        void this.connect();
         return;
       }
 
@@ -145,10 +169,15 @@ export class PresenceClient {
       const wsUrl = getWsEndpointUrl();
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
+      this.socketIdentity = authIdentity;
 
       ws.onopen = () => {
+        if (this.ws !== ws || connectionGeneration !== this.connectionGeneration) return;
         this.isConnecting = false;
-        if (this.ws !== ws) return;
+        if (authIdentity !== getAuthSessionIdentity()) {
+          this.disconnectSocket();
+          return;
+        }
         this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 
         const session = getAuthSession();
@@ -181,7 +210,7 @@ export class PresenceClient {
       };
 
       ws.onclose = () => {
-        this.isConnecting = false;
+        if (connectionGeneration === this.connectionGeneration) this.isConnecting = false;
         if (this.ws !== ws) return;
         this.clearTimers();
         this.ws = null;
@@ -189,15 +218,17 @@ export class PresenceClient {
       };
 
       ws.onerror = () => {
-        this.isConnecting = false;
+        if (connectionGeneration === this.connectionGeneration) this.isConnecting = false;
         if (this.ws !== ws) return;
         this.clearTimers();
         this.disconnectSocket();
         this.scheduleReconnect();
       };
     } catch {
-      this.isConnecting = false;
-      this.scheduleReconnect();
+      if (connectionGeneration === this.connectionGeneration) {
+        this.isConnecting = false;
+        this.scheduleReconnect();
+      }
     }
   }
 

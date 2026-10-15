@@ -56,6 +56,7 @@ describe("PresenceClient", () => {
   });
 
   afterEach(() => {
+    authSession.setAuthSession(null);
     globalThis.WebSocket = originalWebSocket;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -113,6 +114,92 @@ describe("PresenceClient", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(mockSockets.length).toBe(0);
 
+    client.stop();
+  });
+
+  it("replaces an account A handshake with account B and never opens A's socket", async () => {
+    const accountA = {
+      accessToken: "account-a-token",
+      refreshToken: "account-a-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-a", email: "a@example.com" },
+    };
+    const accountB = {
+      accessToken: "account-b-token",
+      refreshToken: "account-b-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-b", email: "b@example.com" },
+    };
+    let activeSession = accountA;
+    authSession.setAuthSession(accountA);
+    vi.spyOn(authSession, "getAuthSession").mockImplementation(() => activeSession);
+    let resolveAccountA!: (token: string) => void;
+    vi.spyOn(authSession, "getValidAccessToken")
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveAccountA = resolve; }))
+      .mockResolvedValue("account-b-token");
+
+    const client = new PresenceClient(100);
+    client.start();
+    await Promise.resolve();
+    activeSession = accountB;
+    authSession.setAuthSession(accountB);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    resolveAccountA("account-a-token");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(mockSockets).toHaveLength(1);
+    expect(JSON.parse(mockSockets[0].sentData[0]).token).toBe("account-b-token");
+    expect(JSON.parse(mockSockets[0].sentData[0]).userId).toBe("account-b");
+    client.stop();
+  });
+
+  it("ignores a late token result from a previous stop and restart cycle", async () => {
+    const first = new Promise<string>((resolve) => setTimeout(() => resolve("old-token"), 15));
+    const second = new Promise<string>((resolve) => setTimeout(() => resolve("current-token"), 0));
+    vi.spyOn(authSession, "getValidAccessToken")
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second);
+    const currentSession = {
+      accessToken: "current-token",
+      refreshToken: "current-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "current-user", email: "current@example.com" },
+    };
+    authSession.setAuthSession(currentSession);
+    vi.spyOn(authSession, "getAuthSession").mockReturnValue(currentSession);
+    const client = new PresenceClient(100);
+
+    client.start();
+    client.stop();
+    client.start();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(authSession.getValidAccessToken).toHaveBeenCalledTimes(2);
+    expect(mockSockets).toHaveLength(1);
+    expect(JSON.parse(mockSockets[0].sentData[0]).token).toBe("current-token");
+    client.stop();
+  });
+
+  it("keeps the active socket for routine same-user token refresh", async () => {
+    const getSession = vi.spyOn(authSession, "getAuthSession");
+    const firstSession = authSession.getAuthSession()!;
+    authSession.setAuthSession(firstSession);
+    const client = new PresenceClient(100);
+    client.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const socket = mockSockets[0];
+
+    const rotatedSession = {
+      ...firstSession,
+      accessToken: "rotated-same-user-token",
+    };
+    getSession.mockReturnValue(rotatedSession);
+    authSession.setAuthSession(rotatedSession);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockSockets).toHaveLength(1);
+    expect(client.getSocketState()).toBe(MockWebSocket.OPEN);
+    expect(mockSockets[0]).toBe(socket);
     client.stop();
   });
 });

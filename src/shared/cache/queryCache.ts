@@ -9,6 +9,7 @@ class QueryCacheStore {
   private store = new Map<string, CacheRecord<any>>();
   private listeners = new Map<string, Set<(data: any) => void>>();
   private inFlight = new Map<string, Promise<any>>();
+  private requestIds = new Map<string, object>();
 
   public get<T>(key: string): T | undefined {
     const record = this.store.get(key);
@@ -43,11 +44,14 @@ class QueryCacheStore {
 
   public delete(key: string): void {
     this.store.delete(key);
+    this.inFlight.delete(key);
+    this.requestIds.delete(key);
   }
 
   public clear(): void {
     this.store.clear();
     this.inFlight.clear();
+    this.requestIds.clear();
   }
 
   public getStats(): { count: number; bytes: number } {
@@ -108,13 +112,20 @@ class QueryCacheStore {
 
     let promise = this.inFlight.get(key);
     if (!promise) {
+      const requestId = {};
+      this.requestIds.set(key, requestId);
       promise = (async () => {
         try {
           const freshData = await fetcher();
-          this.set(key, freshData, staleTimeMs, gcTimeMs);
+          if (this.requestIds.get(key) === requestId) {
+            this.set(key, freshData, staleTimeMs, gcTimeMs);
+          }
           return freshData;
         } finally {
-          this.inFlight.delete(key);
+          if (this.requestIds.get(key) === requestId) {
+            this.inFlight.delete(key);
+            this.requestIds.delete(key);
+          }
         }
       })();
       this.inFlight.set(key, promise);
@@ -131,13 +142,20 @@ class QueryCacheStore {
     gcTimeMs: number,
   ): Promise<void> {
     if (this.inFlight.has(key)) return;
+    const requestId = {};
+    this.requestIds.set(key, requestId);
     const promise = (async () => {
       try {
         const freshData = await fetcher();
-        this.set(key, freshData, staleTimeMs, gcTimeMs);
+        if (this.requestIds.get(key) === requestId) {
+          this.set(key, freshData, staleTimeMs, gcTimeMs);
+        }
       } catch {
       } finally {
-        this.inFlight.delete(key);
+        if (this.requestIds.get(key) === requestId) {
+          this.inFlight.delete(key);
+          this.requestIds.delete(key);
+        }
       }
     })();
     this.inFlight.set(key, promise);

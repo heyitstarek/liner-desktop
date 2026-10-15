@@ -3,21 +3,104 @@ import { signApiRequest, syncServerTime } from "./requestSigner";
 
 export type { AuthTokens, AuthUser };
 
-import { DEFAULT_PRIMARY_API, getApiBaseUrl, switchToPrimaryApi } from "./baseUrl";
+import { getApiBaseUrl } from "./baseUrl";
  
 const STORAGE_KEY = "liner_auth_session";
 
 let session: AuthTokens | null = null;
-let refreshPromise: Promise<AuthTokens | null> | null = null;
+let sessionInitialized = false;
+let sessionGeneration = 0;
+let sessionBoundaryGeneration = 0;
+let refreshPromise: { generation: number; requestId: object; promise: Promise<AuthTokens | null> } | null = null;
+const AUTH_REQUEST_TIMEOUT_MS = 15_000;
 
 function load(): AuthTokens | null {
   if (typeof window === "undefined") return null;
   try {
     const value = localStorage.getItem(STORAGE_KEY);
-    return value ? (JSON.parse(value) as AuthTokens) : null;
+    const parsed: unknown = value ? JSON.parse(value) : null;
+    return isAuthTokens(parsed) ? parsed : null;
   } catch {
     return null;
   }
+}
+
+function isAuthTokens(value: unknown): value is AuthTokens {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<AuthTokens>;
+  return typeof candidate.accessToken === "string" && candidate.accessToken.length > 0
+    && typeof candidate.refreshToken === "string" && candidate.refreshToken.length > 0
+    && typeof candidate.accessTokenExpiresAt === "string"
+    && !!candidate.user && typeof candidate.user.id === "string";
+}
+
+type NativeAuthStorage = Pick<NonNullable<Window["linerElectron"]>, "loadAuthSession" | "saveAuthSession" | "clearAuthSession">;
+let nativeAuthStorage: NativeAuthStorage | null = null;
+let initializationPromise: Promise<void> | null = null;
+let nativePersistenceQueue: Promise<void> = Promise.resolve();
+
+function removeLegacySession(): void {
+  if (typeof window === "undefined") return;
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* In-memory auth remains authoritative. */ }
+}
+
+function queueNativePersistence(next: AuthTokens | null): Promise<boolean> {
+  const bridge = nativeAuthStorage;
+  if (!bridge) return Promise.resolve(false);
+  const operation = nativePersistenceQueue.catch(() => undefined).then(async () => {
+    try {
+      if (next) return await bridge.saveAuthSession(next);
+      return await bridge.clearAuthSession();
+    } catch {
+      // Persistence is best-effort; never surface token bytes through errors or logs.
+      return false;
+    }
+  });
+  nativePersistenceQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+/** Hydrates protected Electron storage before the app renders; browser storage stays unchanged. */
+export function initializeAuthSession(): Promise<void> {
+  if (initializationPromise) return initializationPromise;
+  // Preserve the legacy value in memory while the asynchronous native read is pending.
+  getAuthSession();
+  const bridge = typeof window !== "undefined" ? window.linerElectron : undefined;
+  if (!bridge?.loadAuthSession || !bridge.saveAuthSession || !bridge.clearAuthSession) {
+    sessionInitialized = true;
+    initializationPromise = Promise.resolve();
+    return initializationPromise;
+  }
+
+  nativeAuthStorage = bridge;
+  const generationAtStart = sessionGeneration;
+  const legacy = load();
+  initializationPromise = (async () => {
+    let protectedSession: unknown = null;
+    try { protectedSession = await bridge.loadAuthSession(); } catch { /* Continue with memory-only migration. */ }
+    if (sessionGeneration !== generationAtStart) return;
+
+    const chosen = isAuthTokens(protectedSession) ? protectedSession : legacy;
+    if (chosen && !isAuthTokens(protectedSession)) {
+      await queueNativePersistence(chosen);
+    }
+    // Once a native in-memory session is selected, never retain tokens in renderer storage.
+    removeLegacySession();
+    if (sessionGeneration !== generationAtStart) return;
+
+    session = chosen;
+    sessionInitialized = true;
+    sessionGeneration++;
+    sessionBoundaryGeneration++;
+    emit();
+  })().catch(() => {
+    // A native storage failure must not block application startup or expose its error.
+    if (sessionGeneration === generationAtStart) {
+      removeLegacySession();
+      sessionInitialized = true;
+    }
+  });
+  return initializationPromise;
 }
 
 function emit() {
@@ -27,17 +110,55 @@ function emit() {
 }
 
 export function getAuthSession(): AuthTokens | null {
-  if (!session) session = load();
+  if (!sessionInitialized) {
+    session = load();
+    sessionInitialized = true;
+  }
   return session;
 }
 
-export function setAuthSession(next: AuthTokens | null): void {
+/** Changes whenever the locally active auth session is replaced or cleared. */
+export function getAuthSessionGeneration(): number {
+  return sessionGeneration;
+}
+
+/** Changes on login, logout, or account replacement, but not on token refresh. */
+export function getAuthSessionBoundaryGeneration(): number {
+  return sessionBoundaryGeneration;
+}
+
+/** Stable, non-secret account namespace used for caller-side request isolation. */
+export function getAuthSessionIdentity(): string {
+  const current = getAuthSession();
+  if (!current?.accessToken) return "anonymous";
+  return current.user?.id ? `user:${current.user.id}` : `session:${sessionBoundaryGeneration}`;
+}
+
+function updateAuthSession(next: AuthTokens | null, preserveIdentity: boolean): void {
+  sessionGeneration++;
+  if (!preserveIdentity) {
+    sessionBoundaryGeneration++;
+  }
   session = next;
+  sessionInitialized = true;
   if (typeof window !== "undefined") {
-    if (next) localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    else localStorage.removeItem(STORAGE_KEY);
+    if (nativeAuthStorage) {
+      removeLegacySession();
+      queueNativePersistence(next);
+    } else {
+      try {
+        if (next) localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+        else localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // In-memory auth state remains authoritative when browser storage is unavailable.
+      }
+    }
   }
   emit();
+}
+
+export function setAuthSession(next: AuthTokens | null): void {
+  updateAuthSession(next, false);
 }
 
 export function getAccessToken(): string | null {
@@ -79,9 +200,14 @@ export function getSessionExpiryMs(s: AuthTokens | null): number | null {
  */
 export async function getValidAccessToken(): Promise<string | null> {
   // If a refresh is ALREADY in flight, await it to prevent concurrent requests from using stale tokens
-  if (refreshPromise) {
-    const refreshed = await refreshPromise;
-    return refreshed?.accessToken ?? getAuthSession()?.accessToken ?? null;
+  const generation = getAuthSessionGeneration();
+  const boundaryGeneration = getAuthSessionBoundaryGeneration();
+  if (refreshPromise?.generation === generation) {
+    const refreshed = await refreshPromise.promise;
+    if (getAuthSessionBoundaryGeneration() !== boundaryGeneration) return null;
+    if (refreshed?.accessToken) return refreshed.accessToken;
+    if (getAuthSessionGeneration() !== generation) return null;
+    return getAuthSession()?.accessToken ?? null;
   }
 
   const current = getAuthSession();
@@ -91,7 +217,9 @@ export async function getValidAccessToken(): Promise<string | null> {
   // If token expiry is known and expires in less than 2 minutes (120s), proactively refresh
   if (expiresAtMs !== null && expiresAtMs - Date.now() < 120_000) {
     const refreshed = await refreshAuthSession();
+    if (getAuthSessionBoundaryGeneration() !== boundaryGeneration) return null;
     if (refreshed?.accessToken) return refreshed.accessToken;
+    if (getAuthSessionGeneration() !== generation) return null;
     // If refresh failed (e.g. transient network glitch), but token is still within validity window,
     // fallback to current token rather than failing immediately
     if (expiresAtMs > Date.now()) return current.accessToken;
@@ -106,9 +234,8 @@ export async function getValidAccessToken(): Promise<string | null> {
  * Guaranteed to only initiate one in-flight refresh request across all parallel callers.
  */
 export function refreshAuthSession(): Promise<AuthTokens | null> {
-  if (refreshPromise) {
-    return refreshPromise;
-  }
+  const generation = getAuthSessionGeneration();
+  if (refreshPromise?.generation === generation) return refreshPromise.promise;
 
   const current = getAuthSession();
   if (!current?.refreshToken) {
@@ -116,38 +243,27 @@ export function refreshAuthSession(): Promise<AuthTokens | null> {
   }
 
   // Synchronously assign the promise to immediately lock out any concurrent callers
-  refreshPromise = (async () => {
+  const requestId = {};
+  const promise = (async () => {
     try {
       const body = JSON.stringify({ refreshToken: current.refreshToken });
-      let signedHeaders = await signApiRequest("POST", "/v1/auth/refresh", body);
-
+      const signedHeaders = await signApiRequest("POST", "/v1/auth/refresh", body);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), AUTH_REQUEST_TIMEOUT_MS);
       let response: Response;
       try {
         response = await fetch(`${getApiBaseUrl()}/v1/auth/refresh`, {
           method: "POST",
           redirect: "error",
+          signal: controller.signal,
           headers: {
             "Content-Type": "application/json",
             ...signedHeaders,
           },
           body,
         });
-      } catch (networkErr) {
-        if (getApiBaseUrl() !== DEFAULT_PRIMARY_API) {
-          switchToPrimaryApi();
-          signedHeaders = await signApiRequest("POST", "/v1/auth/refresh", body);
-          response = await fetch(`${getApiBaseUrl()}/v1/auth/refresh`, {
-            method: "POST",
-            redirect: "error",
-            headers: {
-              "Content-Type": "application/json",
-              ...signedHeaders,
-            },
-            body,
-          });
-        } else {
-          throw networkErr;
-        }
+      } finally {
+        clearTimeout(timeout);
       }
 
       const dateHeader = response.headers?.get?.("date");
@@ -160,7 +276,7 @@ export function refreshAuthSession(): Promise<AuthTokens | null> {
         // only clear the stored session if it hasn't already been rotated by another process
         if (response.status === 401 || response.status === 403) {
           const latest = getAuthSession();
-          if (latest?.refreshToken === current.refreshToken) {
+          if (getAuthSessionGeneration() === generation && latest?.refreshToken === current.refreshToken) {
             setAuthSession(null);
           }
         }
@@ -168,6 +284,10 @@ export function refreshAuthSession(): Promise<AuthTokens | null> {
       }
 
       const next = (await response.json()) as AuthTokens;
+      const latest = getAuthSession();
+      if (getAuthSessionGeneration() !== generation || latest?.refreshToken !== current.refreshToken) {
+        return null;
+      }
       // Preserve existing user info and metadata
       const merged: AuthTokens = {
         ...current,
@@ -175,39 +295,39 @@ export function refreshAuthSession(): Promise<AuthTokens | null> {
         user: next.user || current.user,
       };
 
-      setAuthSession(merged);
+      updateAuthSession(merged, true);
       return merged;
     } catch (err) {
       console.error("[Auth] refreshAuthSession request failed:", err);
       return null;
     } finally {
-      refreshPromise = null;
+      if (refreshPromise?.requestId === requestId) refreshPromise = null;
     }
   })();
 
-  return refreshPromise;
+  refreshPromise = { generation, requestId, promise };
+  return promise;
 }
 
 export async function clearAuthSession(): Promise<void> {
-  let current = getAuthSession();
-  const expiryMs = getSessionExpiryMs(current);
-  if (current && expiryMs !== null && expiryMs <= Date.now()) {
-    current = (await refreshAuthSession()) ?? current;
-  }
+  const current = getAuthSession();
   setAuthSession(null);
   if (!current?.refreshToken) return;
   const body = JSON.stringify({ refreshToken: current.refreshToken });
   const signedHeaders = await signApiRequest("POST", "/v1/auth/logout", body);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AUTH_REQUEST_TIMEOUT_MS);
   const response = await fetch(`${getApiBaseUrl()}/v1/auth/logout`, {
     method: "POST",
     redirect: "error",
+    signal: controller.signal,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${current.accessToken}`,
       ...signedHeaders,
     },
     body,
-  }).catch(() => undefined);
+  }).catch(() => undefined).finally(() => clearTimeout(timeout));
   if (response?.headers) {
     const logoutDate = response.headers?.get?.("date");
     if (logoutDate) syncServerTime(logoutDate);

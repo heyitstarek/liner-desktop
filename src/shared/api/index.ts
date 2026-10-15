@@ -54,7 +54,9 @@ export type {
 } from "@/shared/contracts";
 
 export {
+  initializeAuthSession,
   getAuthSession,
+  getAuthSessionIdentity,
   setAuthSession,
   getAccessToken,
   getSessionExpiryMs,

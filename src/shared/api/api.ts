@@ -1,6 +1,8 @@
 import {
   getAccessToken,
   getAuthSession,
+  getAuthSessionBoundaryGeneration,
+  getAuthSessionIdentity,
   getSessionExpiryMs,
   getValidAccessToken,
   refreshAuthSession,
@@ -40,7 +42,7 @@ function translate(key: string, vars?: Record<string, string | number>) {
   }
 }
 
-import { DEFAULT_PRIMARY_API, getApiBaseUrl, switchToPrimaryApi } from "./baseUrl";
+import { getApiBaseUrl } from "./baseUrl";
 
 const CLIENT_VERSION =
   (import.meta.env.VITE_CLIENT_VERSION as string | undefined) || "1.0.4-desktop";
@@ -182,9 +184,18 @@ async function executeRequest<T>(
   const startTime = performance.now();
   const method = (init?.method ?? "GET").toUpperCase();
   const rawBody = typeof init?.body === "string" ? init.body : null;
+  const requestIdentity = getAuthSessionIdentity();
+  const requestBoundary = getAuthSessionBoundaryGeneration();
   const signedHeaders = await signApiRequest(method, path, rawBody);
   const currentSession = getAuthSession();
   let accessToken = allowRefresh ? await getValidAccessToken() : null;
+
+  if (
+    getAuthSessionIdentity() !== requestIdentity ||
+    getAuthSessionBoundaryGeneration() !== requestBoundary
+  ) {
+    throw new ApiError(0, "Auth session changed while the request was pending.", "SESSION_CHANGED");
+  }
 
   if (allowRefresh && currentSession?.accessToken && !accessToken && !path.startsWith("/v1/auth/")) {
     const expiryMs = getSessionExpiryMs(currentSession);
@@ -244,50 +255,17 @@ async function executeRequest<T>(
     if (init?.signal?.aborted || err?.name === "AbortError") {
       throw err;
     }
-    if (getApiBaseUrl() !== DEFAULT_PRIMARY_API) {
-      switchToPrimaryApi();
-      try {
-        const primarySigned = await signApiRequest(method, path, rawBody);
-        res = await fetchWithTimeout(
-          getApiBaseUrl() + path,
-          {
-            ...init,
-            headers: {
-              ...(hasBody ? { "Content-Type": "application/json" } : {}),
-              ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-              ...correlationHeaders,
-              ...primarySigned,
-              ...restHeaders,
-            },
-          },
-          timeoutMs,
-        );
-      } catch (primaryErr) {
-        const durationMs = Math.round(performance.now() - startTime);
-        telemetry.trackNetwork(method, path, 0, durationMs, requestId);
-        if (isConnectivityFailure(primaryErr) && !isPlaybackPath(path)) {
-          recordConnectivityFailure({
-            method,
-            path: stripQuery(path),
-            status: statusOf(primaryErr),
-            latencyMs: durationMs,
-          });
-        }
-        throw primaryErr;
-      }
-    } else {
-      const durationMs = Math.round(performance.now() - startTime);
-      telemetry.trackNetwork(method, path, 0, durationMs, requestId);
-      if (isConnectivityFailure(err) && !isPlaybackPath(path)) {
-        recordConnectivityFailure({
-          method,
-          path: stripQuery(path),
-          status: statusOf(err),
-          latencyMs: durationMs,
-        });
-      }
-      throw err;
+    const durationMs = Math.round(performance.now() - startTime);
+    telemetry.trackNetwork(method, path, 0, durationMs, requestId);
+    if (isConnectivityFailure(err) && !isPlaybackPath(path)) {
+      recordConnectivityFailure({
+        method,
+        path: stripQuery(path),
+        status: statusOf(err),
+        latencyMs: durationMs,
+      });
     }
+    throw err;
   }
 
   // sync server time offset from response Date header
@@ -297,6 +275,12 @@ async function executeRequest<T>(
   }
 
   if (res.status === 401 && allowRefresh && !path.startsWith("/v1/auth/")) {
+    if (
+      getAuthSessionIdentity() !== requestIdentity ||
+      getAuthSessionBoundaryGeneration() !== requestBoundary
+    ) {
+      throw new ApiError(0, "Auth session changed before the request could be retried.", "SESSION_CHANGED");
+    }
     const currentSession = getAuthSession();
     // If the token in session store was already rotated by another parallel request,
     // retry immediately with the rotated token without firing duplicate refresh requests
@@ -340,6 +324,12 @@ async function executeRequest<T>(
       path,
       rawBody,
     );
+    if (
+      getAuthSessionIdentity() !== requestIdentity ||
+      getAuthSessionBoundaryGeneration() !== requestBoundary
+    ) {
+      throw new ApiError(0, "Auth session changed before the request could be retried.", "SESSION_CHANGED");
+    }
     try {
       res = await fetchWithTimeout(
         getApiBaseUrl() + path,
@@ -428,7 +418,7 @@ async function request<T>(
 ): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
   if (method === "GET" && !init?.signal) {
-    const key = `${path}::${allowRefresh}`;
+    const key = `${getAuthSessionIdentity()}::${getAuthSessionBoundaryGeneration()}::${path}::${allowRefresh}`;
     const inFlight = inFlightGetRequests.get(key);
     if (inFlight) {
       return inFlight as Promise<T>;
@@ -571,11 +561,15 @@ import type {
 
 export const api = {
   async login(email: string, password: string): Promise<AuthTokens> {
+    const boundary = getAuthSessionBoundaryGeneration();
     const result = await request<AuthTokens>(
       "/v1/auth/login",
       { method: "POST", body: JSON.stringify({ email, password }) },
       false,
     );
+    if (getAuthSessionBoundaryGeneration() !== boundary) {
+      throw new ApiError(0, "Auth session changed while login was pending.", "SESSION_CHANGED");
+    }
     setAuthSession(result);
     return result;
   },
@@ -586,6 +580,7 @@ export const api = {
     username: string,
     displayName: string,
   ): Promise<AuthTokens> {
+    const boundary = getAuthSessionBoundaryGeneration();
     const result = await request<AuthTokens>(
       "/v1/auth/register",
       {
@@ -599,6 +594,9 @@ export const api = {
       },
       false,
     );
+    if (getAuthSessionBoundaryGeneration() !== boundary) {
+      throw new ApiError(0, "Auth session changed while registration was pending.", "SESSION_CHANGED");
+    }
     setAuthSession(result);
     return result;
   },
@@ -951,24 +949,7 @@ export const api = {
       if (signal?.aborted || fetchErr?.name === "AbortError") {
         throw fetchErr;
       }
-      if (getApiBaseUrl() !== DEFAULT_PRIMARY_API) {
-        switchToPrimaryApi();
-        const primarySigned = await signApiRequest("GET", path);
-        res = await fetch(
-          `${getApiBaseUrl()}${path}`,
-          {
-            signal,
-            redirect: "error",
-            headers: {
-              ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-              ...correlationHeaders,
-              ...primarySigned,
-            },
-          },
-        );
-      } else {
-        throw fetchErr;
-      }
+      throw fetchErr;
     }
 
     const lyricsDateHeader = res.headers?.get?.("date");
@@ -984,49 +965,73 @@ export const api = {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let dataLines: string[] = [];
+    let completed = false;
+    const cancelReaderOnAbort = () => {
+      void reader.cancel(signal?.reason).catch(() => {});
+    };
+    signal?.addEventListener("abort", cancelReaderOnAbort, { once: true });
 
-    const flushEvent = (): LyricsStreamEvent | null => {
-      const sep = buffer.indexOf("\n\n");
-      if (sep === -1) return null;
-      const rawEvent = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
+    const consumeLines = (final = false): LyricsStreamEvent[] => {
+      const events: LyricsStreamEvent[] = [];
+      let lineStart = 0;
+      for (let index = 0; index < buffer.length; index++) {
+        const code = buffer[index];
+        if (code !== "\r" && code !== "\n") continue;
+        if (code === "\r" && index === buffer.length - 1 && !final) break;
 
-      const dataLines: string[] = [];
-      for (const line of rawEvent.split("\n")) {
-        if (line.startsWith("data:")) {
-          dataLines.push(line.slice(5).trim());
+        const line = buffer.slice(lineStart, index);
+        if (code === "\r" && buffer[index + 1] === "\n") index++;
+        lineStart = index + 1;
+
+        if (line === "") {
+          if (dataLines.length > 0) {
+            try {
+              events.push(JSON.parse(dataLines.join("\n")) as LyricsStreamEvent);
+            } catch {
+              // A malformed event is discarded; later complete frames remain readable.
+            }
+          }
+          dataLines = [];
+          continue;
         }
+        if (line.startsWith(":")) continue;
+        const separator = line.indexOf(":");
+        const field = separator === -1 ? line : line.slice(0, separator);
+        let value = separator === -1 ? "" : line.slice(separator + 1);
+        if (value.startsWith(" ")) value = value.slice(1);
+        if (field === "data") dataLines.push(value);
       }
-
-      if (dataLines.length === 0) return null;
-      try {
-        return JSON.parse(dataLines.join("\n")) as LyricsStreamEvent;
-      } catch {
-        return null;
-      }
+      buffer = buffer.slice(lineStart);
+      return events;
     };
 
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let event = flushEvent();
-        while (event) {
-          yield event;
-          event = flushEvent();
+        if (signal?.aborted) {
+          throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
         }
+        if (done) {
+          completed = true;
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        for (const event of consumeLines()) yield event;
       }
 
       buffer += decoder.decode();
-      let event = flushEvent();
-      while (event) {
-        yield event;
-        event = flushEvent();
-      }
+      for (const event of consumeLines(true)) yield event;
     } finally {
-      reader.releaseLock();
+      signal?.removeEventListener("abort", cancelReaderOnAbort);
+      if (!completed) {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
+      try {
+        reader.releaseLock();
+      } catch {}
     }
   },
 

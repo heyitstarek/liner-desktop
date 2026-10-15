@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   getAuthSession,
+  clearAuthSession,
+  getAuthSessionIdentity,
   setAuthSession,
   getValidAccessToken,
   refreshAuthSession,
@@ -45,6 +47,52 @@ describe("auth-session token system", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
+  });
+
+  it("uses an opaque identity for sessions without a user id", () => {
+    const accessToken = "private-access-token-value";
+    const refreshToken = "private-refresh-token-value";
+    setAuthSession({ accessToken, refreshToken, accessTokenExpiresAt: "", user: { id: "", email: "opaque@example.com" } });
+
+    const identity = getAuthSessionIdentity();
+    expect(identity).toMatch(/^session:\d+$/);
+    expect(identity).not.toContain(accessToken);
+    expect(identity).not.toContain(refreshToken);
+  });
+
+  it("keeps logout cleared in memory if browser storage removal fails", () => {
+    const persisted: AuthTokens = {
+      accessToken: "persisted-access",
+      refreshToken: "persisted-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "persisted-user" },
+    };
+    storageMap.set("liner_auth_session", JSON.stringify(persisted));
+    setAuthSession(persisted);
+    localStorageMock.removeItem.mockImplementationOnce(() => {
+      throw new Error("storage unavailable");
+    });
+    const dispatch = vi.spyOn(window, "dispatchEvent");
+
+    expect(() => setAuthSession(null)).not.toThrow();
+    expect(getAuthSession()).toBeNull();
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "auth:changed" }));
+    expect(storageMap.has("liner_auth_session")).toBe(true);
+  });
+
+  it("keeps a new in-memory session if browser storage writes fail", () => {
+    const next: AuthTokens = {
+      accessToken: "memory-access",
+      refreshToken: "memory-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "memory-user", email: "memory@example.com" },
+    };
+    localStorageMock.setItem.mockImplementationOnce(() => {
+      throw new Error("storage unavailable");
+    });
+
+    expect(() => setAuthSession(next)).not.toThrow();
+    expect(getAuthSession()).toEqual(next);
   });
 
   it("calculates expiry timestamp correctly from ISO string or numeric epoch", () => {
@@ -117,6 +165,107 @@ describe("auth-session token system", () => {
     const stored = getAuthSession();
     expect(stored?.accessToken).toBe("new_token_456");
     expect(stored?.user.email).toBe("user@example.com");
+  });
+
+  it("does not let an older refresh restore a session after logout or account switch", async () => {
+    const first: AuthTokens = {
+      accessToken: "account-a-access",
+      refreshToken: "account-a-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-a", email: "a@example.com" },
+    };
+    const second: AuthTokens = {
+      accessToken: "account-b-access",
+      refreshToken: "account-b-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-b", email: "b@example.com" },
+    };
+    setAuthSession(first);
+    let resolveRefresh!: (response: any) => void;
+    globalThis.fetch = vi.fn(() => new Promise((resolve) => { resolveRefresh = resolve; })) as any;
+
+    const refresh = refreshAuthSession();
+    await Promise.resolve();
+    setAuthSession(second);
+    resolveRefresh({ ok: true, json: async () => ({ accessToken: "a-rotated", refreshToken: "a-refresh-rotated" }) });
+
+    expect(await refresh).toBeNull();
+    expect(getAuthSession()).toEqual(second);
+  });
+
+  it("does not return a captured token after the session changes during refresh", async () => {
+    const first: AuthTokens = {
+      accessToken: "account-a-access",
+      refreshToken: "account-a-refresh",
+      accessTokenExpiresAt: new Date(Date.now() + 10_000).toISOString(),
+      user: { id: "account-a", email: "a@example.com" },
+    };
+    const second: AuthTokens = {
+      accessToken: "account-b-access",
+      refreshToken: "account-b-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-b", email: "b@example.com" },
+    };
+    setAuthSession(first);
+    let resolveRefresh!: (response: any) => void;
+    globalThis.fetch = vi.fn(() => new Promise((resolve) => { resolveRefresh = resolve; })) as any;
+
+    const tokenPromise = getValidAccessToken();
+    await Promise.resolve();
+    setAuthSession(second);
+    resolveRefresh({ ok: false, status: 500 });
+
+    expect(await tokenPromise).toBeNull();
+    expect(getAuthSession()).toEqual(second);
+  });
+
+  it("does not return account A's rotated token when auth:changed installs account B", async () => {
+    const first: AuthTokens = {
+      accessToken: "account-a-access",
+      refreshToken: "account-a-refresh",
+      accessTokenExpiresAt: new Date(Date.now() + 10_000).toISOString(),
+      user: { id: "account-a", email: "a@example.com" },
+    };
+    const second: AuthTokens = {
+      accessToken: "account-b-access",
+      refreshToken: "account-b-refresh",
+      accessTokenExpiresAt: "",
+      user: { id: "account-b", email: "b@example.com" },
+    };
+    setAuthSession(first);
+    const replaceOnRefreshCommit = () => setAuthSession(second);
+    window.addEventListener("auth:changed", replaceOnRefreshCommit, { once: true });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ accessToken: "account-a-rotated", refreshToken: "account-a-refresh-rotated" }),
+    }) as any;
+
+    expect(await getValidAccessToken()).toBeNull();
+    expect(getAuthSession()).toEqual(second);
+  });
+
+  it("clears local auth before waiting for an expired in-flight refresh", async () => {
+    const expiring: AuthTokens = {
+      accessToken: "account-a-access",
+      refreshToken: "account-a-refresh",
+      accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+      user: { id: "account-a", email: "a@example.com" },
+    };
+    setAuthSession(expiring);
+    let resolveRefresh!: (response: any) => void;
+    globalThis.fetch = vi.fn((url: string) => url.endsWith("/v1/auth/refresh")
+      ? new Promise((resolve) => { resolveRefresh = resolve; })
+      : Promise.resolve(new Response(null, { status: 204 }))) as any;
+
+    const refresh = refreshAuthSession();
+    await Promise.resolve();
+    const clearing = clearAuthSession();
+    await Promise.resolve();
+    expect(getAuthSession()).toBeNull();
+    resolveRefresh({ ok: true, json: async () => ({ accessToken: "resurrected", refreshToken: "rotated" }) });
+    await clearing;
+    await refresh;
+    expect(getAuthSession()).toBeNull();
   });
 
   it("proactively refreshes token in getValidAccessToken when close to expiry", async () => {
